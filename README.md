@@ -1,5 +1,39 @@
 # lubelogger-mcp
 
+## About this fork
+
+This is a fork of [drakebridgewater/lubelogger-mcp](https://github.com/drakebridgewater/lubelogger-mcp), branched from upstream commit `e182246` (2026-10-19), which was reviewed in full before forking. Upstream declares the MIT license in `package.json`; it has no LICENSE file.
+
+Every request it sends was checked against the LubeLogger 1.7.4 source: routes, field names, JSON converters and required fields. Like upstream, it has not yet been run against a live instance.
+
+### Changes from upstream
+
+- **Refuses to start without a credential.** If `MCP_AUTH_TOKEN` is not set, `MCP_PATH` must contain a random segment of at least 32 characters, e.g. `/mcp/<output of: openssl rand -hex 16>`. Upstream printed a warning and served the endpoint to anyone who could reach it.
+- **Keeps a custom `MCP_PATH` out of the log.** Upstream printed it in its startup line, and for clients that cannot send a bearer token (the Claude app) that path is the only credential.
+- **Patched dependencies**, lockfile only: `body-parser` 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), denial of service) and `fast-uri` 3.1.9 ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) and related).
+- Tests for all of the above in `test/smoke.mjs`, and a `.gitattributes` that keeps line endings LF.
+
+### Pulling changes from upstream
+
+Upstream has one maintainer and its changes have not been reviewed here, so pull them deliberately, never automatically:
+
+```bash
+git fetch upstream
+git log --oneline main..upstream/main   # what's new
+git diff main...upstream/main           # read it before merging
+git merge upstream/main
+npm ci && npm test
+```
+
+In a fresh clone, add the remote first, with pushing disabled so nothing can be pushed to upstream by mistake:
+
+```bash
+git remote add upstream https://github.com/drakebridgewater/lubelogger-mcp.git
+git remote set-url --push upstream DISABLED
+```
+
+## Overview
+
 An [MCP](https://modelcontextprotocol.io) server that lets Claude log service, repair, upgrade, fuel and odometer records into your self-hosted [LubeLogger](https://github.com/hargata/lubelog), and manage maintenance reminders.
 
 You send Claude a photo or PDF of an invoice or receipt. Claude reads it, extracts the fields, shows you a preview, and after you confirm, writes the record to LubeLogger.
@@ -61,8 +95,8 @@ cp .env.example .env
 |---|---|---|
 | `LUBELOGGER_URL` | required | Address of LubeLogger as seen from this container, e.g. `http://lubelogger:8080` |
 | `LUBELOGGER_API_KEY` | required | Sent as the `x-api-key` header |
-| `MCP_AUTH_TOKEN` | unset | If set, every MCP request needs `Authorization: Bearer <token>` |
-| `MCP_PATH` | `/mcp` | Use a long random path (e.g. `/mcp/<random>`) if clients can't send a bearer token |
+| `MCP_AUTH_TOKEN` | unset | If set, every MCP request needs `Authorization: Bearer <token>`. If unset, `MCP_PATH` must hold a secret segment or the server will not start |
+| `MCP_PATH` | `/mcp` | Without `MCP_AUTH_TOKEN`, must contain a random segment of at least 32 characters, e.g. `/mcp/<output of: openssl rand -hex 16>`. A custom path is never printed in the log |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | |
 | `CONFIRM_TTL_MINUTES` | `30` | How long a preview token stays valid |
 | `REQUEST_TIMEOUT_MS` | `15000` | Timeout for LubeLogger calls |
@@ -91,7 +125,7 @@ claude mcp add --transport http lubelogger http://<server>:3000/mcp \
 
 ## Security notes
 
-- This server holds an API key that can add records to your LubeLogger. Don't expose it unauthenticated. Use `MCP_AUTH_TOKEN`, a secret `MCP_PATH`, or keep it LAN/VPN-only.
+- This server holds an API key that can add records to your LubeLogger, so it refuses to start without either `MCP_AUTH_TOKEN` or a secret `MCP_PATH`. Keep it LAN/VPN-only where you can.
 - The confirm-before-write step is enforced as a two-call flow (propose, then commit with a token). That "the user said yes" is Claude's judgment, guided by the tool descriptions. The Claude app's own tool-approval prompt is a second gate if you leave it on for `commit_record`.
 - Costs and amounts are plain numbers in whatever currency and unit LubeLogger is configured for. No conversion happens.
 
