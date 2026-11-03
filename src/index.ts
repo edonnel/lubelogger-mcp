@@ -73,11 +73,10 @@ app.get(config.MCP_PATH, requireToken, methodNotAllowed);
 app.delete(config.MCP_PATH, requireToken, methodNotAllowed);
 
 const httpServer = app.listen(config.PORT, config.HOST, () => {
-  console.error(`lubelogger-mcp listening on http://${config.HOST}:${config.PORT}${config.MCP_PATH}`);
+  // MCP_PATH can be the only credential (clients that cannot send a bearer token), so a custom one is never logged
+  const endpoint = config.MCP_PATH === "/mcp" ? "/mcp" : "a custom MCP_PATH (not shown)";
+  console.error(`lubelogger-mcp listening on http://${config.HOST}:${config.PORT}, endpoint ${endpoint}`);
   console.error(`LubeLogger: ${config.LUBELOGGER_URL}`);
-  if (!config.MCP_AUTH_TOKEN && config.MCP_PATH === "/mcp") {
-    console.error("WARNING: no MCP_AUTH_TOKEN set and MCP_PATH is the default. Anyone who can reach this port can write to LubeLogger.");
-  }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

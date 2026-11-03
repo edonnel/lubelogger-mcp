@@ -19,12 +19,26 @@ const schema = z.object({
   REQUEST_TIMEOUT_MS: z.coerce.number().positive().default(15_000),
 });
 
+/** Shortest path segment accepted as a secret when there is no bearer token: 32 hex characters is 128 bits. */
+const MIN_SECRET_SEGMENT = 32;
+
+// Without a bearer token the path is the only credential, so refuse to serve an endpoint anyone could find.
+const checkedSchema = schema.refine(
+  (c) => c.MCP_AUTH_TOKEN !== undefined || c.MCP_PATH.split("/").some((s) => s.length >= MIN_SECRET_SEGMENT),
+  {
+    path: ["MCP_PATH"],
+    message:
+      `needs a random segment of at least ${MIN_SECRET_SEGMENT} characters when MCP_AUTH_TOKEN is not set ` +
+      "(e.g. /mcp/<output of: openssl rand -hex 16>). Otherwise anyone who can reach the port can write to LubeLogger.",
+  },
+);
+
 export type Config = z.infer<typeof schema>;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // Treat empty strings (common with docker compose ${VAR:-}) as unset.
   const cleaned = Object.fromEntries(Object.entries(env).filter(([, v]) => v !== undefined && v !== ""));
-  const parsed = schema.safeParse(cleaned);
+  const parsed = checkedSchema.safeParse(cleaned);
   if (!parsed.success) {
     const problems = parsed.error.issues.map((i) => `  - ${i.path.join(".") || "(env)"}: ${i.message}`).join("\n");
     console.error(`Invalid configuration:\n${problems}`);

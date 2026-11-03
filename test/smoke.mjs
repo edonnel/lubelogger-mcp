@@ -104,6 +104,31 @@ const callOrReject = async (client, name, args) => {
 let passed = 0;
 const pass = (name) => console.log(`  ok  ${name}`) || passed++;
 
+// Starts a throwaway server with the given endpoint settings and reports whether it came up or exited.
+async function tryStart(mockPort, endpointEnv) {
+  const port = await freePort();
+  const env = { ...process.env, LUBELOGGER_URL: `http://127.0.0.1:${mockPort}`, LUBELOGGER_API_KEY: API_KEY, PORT: String(port), HOST: "127.0.0.1" };
+  delete env.MCP_AUTH_TOKEN;
+  delete env.MCP_PATH;
+  Object.assign(env, endpointEnv);
+  const child = spawn("node", ["dist/index.js"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  let log = "";
+  child.stderr.on("data", (chunk) => (log += chunk));
+  const exited = new Promise((r) => child.on("exit", (code) => r({ code })));
+  try {
+    for (let i = 0; i < 50; i++) {
+      const done = await Promise.race([exited, new Promise((r) => setTimeout(() => r(null), 100))]);
+      if (done) return { started: false, code: done.code, log };
+      try {
+        if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) return { started: true, log };
+      } catch {}
+    }
+    throw new Error(`server neither started nor exited:\n${log}`);
+  } finally {
+    child.kill();
+  }
+}
+
 async function main() {
   await new Promise((r) => mock.listen(0, "127.0.0.1", r));
   const mockPort = mock.address().port;
@@ -119,7 +144,12 @@ async function main() {
       PORT: String(port),
       HOST: "127.0.0.1",
     },
-    stdio: ["ignore", "inherit", "inherit"],
+    stdio: ["ignore", "inherit", "pipe"],
+  });
+  let serverLog = "";
+  server.stderr.on("data", (chunk) => {
+    serverLog += chunk;
+    process.stderr.write(chunk);
   });
   const base = `http://127.0.0.1:${port}`;
 
@@ -132,6 +162,12 @@ async function main() {
       assert.ok(i < 49, "server did not start");
     }
     pass("server starts and /healthz responds");
+
+    // MCP_PATH can be the only credential (clients that cannot send a bearer token), so it must stay out of the log
+    for (let i = 0; i < 20 && !serverLog.includes("listening on"); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.match(serverLog, /listening on/);
+    assert.ok(!serverLog.includes("secretpath"), `startup log reveals MCP_PATH:\n${serverLog}`);
+    pass("startup log does not reveal MCP_PATH");
 
     // auth
     const noAuth = await fetch(base + MCP_PATH, {
@@ -384,6 +420,27 @@ async function main() {
     pass("update preserves the unused due field and warns on past-due / no-op changes");
 
     await client.close();
+
+    // without a bearer token, a long random path is the only thing keeping strangers from writing to LubeLogger
+    let s = await tryStart(mockPort, {});
+    assert.ok(!s.started, "started with no MCP_AUTH_TOKEN and the default MCP_PATH");
+    assert.notEqual(s.code, 0);
+    assert.match(s.log, /MCP_PATH/);
+    pass("refuses to start with no bearer token and the default path");
+
+    s = await tryStart(mockPort, { MCP_PATH: "/mcp/3f9c1d7a0b4e48f5a6c2d9e18b7f0a3" });
+    assert.ok(!s.started, "started with no MCP_AUTH_TOKEN and a 31-character path segment");
+    pass("refuses a secret path segment shorter than 32 characters");
+
+    s = await tryStart(mockPort, { MCP_PATH: "/mcp/3f9c1d7a0b4e48f5a6c2d9e18b7f0a34" });
+    assert.ok(s.started, `refused a 32-character secret path:\n${s.log}`);
+    assert.ok(!s.log.includes("3f9c1d7a0b4e48f5a6c2d9e18b7f0a34"), `startup log reveals the secret path:\n${s.log}`);
+    pass("starts with a 32-character secret path and keeps it out of the log");
+
+    s = await tryStart(mockPort, { MCP_AUTH_TOKEN: AUTH_TOKEN });
+    assert.ok(s.started, `refused a bearer token with the default path:\n${s.log}`);
+    pass("starts with a bearer token and the default path");
+
     console.log(`\n${passed} checks passed`);
   } finally {
     server.kill();
