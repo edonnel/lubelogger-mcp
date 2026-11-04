@@ -16,7 +16,8 @@ const INSTRUCTIONS = [
   "Logs vehicle maintenance and fuel records into LubeLogger from documents you have read.",
   "Workflow: read the invoice/receipt/photo yourself, extract the fields, call the matching propose_* tool, show the preview to the user,",
   "and call commit_record only after they explicitly confirm.",
-  "Odometer is required for every record. Receipts often lack it: ask the user (typed value or dashboard photo). Never guess it.",
+  "Receipts often lack the odometer: ask the user (typed value or dashboard photo). Never guess it.",
+  "Only vehicles with 'Odometer Optional' turned on in LubeLogger may leave it out, when the user has no reading; it is then saved as 0.",
   "If a vehicle is ambiguous, call list_vehicles and ask.",
   "Reminders (e.g. tire rotation) use the same propose/commit flow: check list_reminders first and prefer propose_reminder_update over a duplicate.",
 ].join(" ");

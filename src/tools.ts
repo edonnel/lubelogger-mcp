@@ -65,6 +65,16 @@ const odometerField = z
       "or send a photo of the dashboard. Never guess, and never reuse the last known reading.",
   );
 
+// LubeLogger's API always needs an odometer, but for vehicles with "Odometer Optional" on, its own form saves 0 when
+// the field is left blank. buildPreview does the same, and still refuses for every other vehicle.
+const optionalOdometerField = odometerField
+  .optional()
+  .describe(
+    "Odometer reading, in the unit LubeLogger is configured for. If the document doesn't show it, ask the user to type it or send a " +
+      "photo of the dashboard. Leave it out only if the user says they don't have it: that is accepted for vehicles with " +
+      "'Odometer Optional' turned on in LubeLogger and saved as 0. Never guess, and never reuse the last known reading.",
+  );
+
 const moneyField = z.number().min(0).max(1_000_000);
 export const tagsField = z.string().max(200).optional().describe("Space-separated tags, e.g. 'oil-change dealer'.");
 export const notesField = z.string().max(4000).optional();
@@ -113,18 +123,33 @@ interface PreviewArgs {
   vehicleQuery: string | number;
   kind: RecordKind;
   date: string;
-  odometer: number;
+  /** Undefined when the document has no reading; only accepted for vehicles with "Odometer Optional" on. */
+  odometer?: number;
   cost?: number;
   details: [string, string][];
   extraWarnings?: string[];
-  buildBody: (latestOdometer: number | null) => Record<string, unknown>;
+  buildBody: (latestOdometer: number | null, odometer: number) => Record<string, unknown>;
 }
+
+/** Preview line for an odometer the user may have left out. */
+const odometerDetail = (odometer: number | undefined): [string, string] => [
+  "Odometer",
+  odometer === undefined ? "not recorded (saved as 0, as LubeLogger does for odometer-optional vehicles)" : fmt(odometer),
+];
 
 async function buildPreview(a: PreviewArgs): Promise<string> {
   const { client, pending, ttlMinutes } = a.deps;
   const vehicles = await client.listVehicles();
   const vehicle = resolveVehicle(vehicles, a.vehicleQuery);
   const warnings: string[] = [...(a.extraWarnings ?? [])];
+
+  if (a.odometer === undefined && vehicle.odometerOptional !== true) {
+    throw new Error(
+      `Odometer is required for ${vehicleLabel(vehicle)}. Ask the user to type it or send a photo of the dashboard. ` +
+        `(It can only be left out for vehicles with "Odometer Optional" turned on in LubeLogger.)`,
+    );
+  }
+  const odometer = a.odometer ?? 0;
 
   let latest: number | null = null;
   try {
@@ -133,13 +158,14 @@ async function buildPreview(a: PreviewArgs): Promise<string> {
     warnings.push(`Could not read the latest odometer for comparison (${err instanceof Error ? err.message : String(err)}).`);
   }
 
-  if (latest !== null && a.odometer < latest) {
+  // a left-out reading is saved as 0, which says nothing about a misread
+  if (a.odometer !== undefined && latest !== null && a.odometer < latest) {
     warnings.push(
       `Odometer ${fmt(a.odometer)} is LOWER than the latest reading on file (${fmt(latest)}). Likely a misread or typo; confirm with the user. ` +
         `(If this is a genuine back-dated entry, that's fine.)`,
     );
   }
-  if (latest !== null && a.odometer - latest > 25_000) {
+  if (a.odometer !== undefined && latest !== null && a.odometer - latest > 25_000) {
     warnings.push(`Odometer jumps ${fmt(a.odometer - latest)} from the latest reading (${fmt(latest)}). Double-check for an extra digit.`);
   }
 
@@ -147,7 +173,7 @@ async function buildPreview(a: PreviewArgs): Promise<string> {
   if (daysBetween(a.date, today) > 1) warnings.push(`Date ${a.date} is in the future.`);
 
   try {
-    const dupes = findDuplicates(await client.listRecords(a.kind, vehicle.id), a.date, a.odometer, a.cost);
+    const dupes = findDuplicates(await client.listRecords(a.kind, vehicle.id), a.date, odometer, a.cost);
     for (const d of dupes) warnings.push(`Possible duplicate: ${d}.`);
   } catch {
     warnings.push("Could not check for duplicate records.");
@@ -157,7 +183,7 @@ async function buildPreview(a: PreviewArgs): Promise<string> {
     kind: a.kind,
     vehicleId: vehicle.id,
     vehicleLabel: vehicleLabel(vehicle),
-    body: a.buildBody(latest),
+    body: a.buildBody(latest, odometer),
   });
 
   const lines = [
@@ -230,12 +256,13 @@ export function registerTools(server: McpServer, deps: Deps): void {
         "Prepare a maintenance record from an invoice, receipt or work order that you have already read (image or PDF). " +
         "Nothing is saved: returns a preview with warnings and a confirmation token. " +
         "recordType: 'service' = scheduled maintenance (oil, filters, tires, brakes); 'repair' = unplanned fix; 'upgrade' = enhancement. " +
-        "Put the shop name and a parts/labor breakdown in notes. Odometer is required; ask the user if the document lacks it.",
+        "Put the shop name and a parts/labor breakdown in notes. Odometer: ask the user if the document lacks it; it may be left out " +
+        "only for vehicles with 'Odometer Optional' on.",
       inputSchema: {
         vehicle: vehicleField,
         recordType: z.enum(["service", "repair", "upgrade"]).default("service"),
         date: dateField,
-        odometer: odometerField,
+        odometer: optionalOdometerField,
         description: z.string().min(1).max(200).describe("Short summary, e.g. 'Oil and filter change'."),
         cost: moneyField.describe("Total cost as a plain number (no currency symbol). Use the invoice total."),
         notes: notesField.describe("Shop name, parts, labor, invoice number, warranty info."),
@@ -255,16 +282,16 @@ export function registerTools(server: McpServer, deps: Deps): void {
           cost: args.cost,
           details: [
             ["Date", args.date],
-            ["Odometer", fmt(args.odometer)],
+            odometerDetail(args.odometer),
             ["Description", args.description],
             ["Cost", args.cost.toFixed(2)],
             ["Notes", args.notes || "(none)"],
             ["Tags", args.tags || "(none)"],
             ...(args.extraFields?.length ? ([["Extra fields", args.extraFields.map((f) => `${f.name}=${f.value}`).join(", ")]] as [string, string][]) : []),
           ],
-          buildBody: () => ({
+          buildBody: (_latest, odometer) => ({
             date: args.date,
-            odometer: args.odometer,
+            odometer,
             description: args.description,
             cost: args.cost,
             notes: args.notes ?? "",
@@ -281,13 +308,14 @@ export function registerTools(server: McpServer, deps: Deps): void {
       title: "Propose fuel record",
       description:
         "Prepare a fuel (or EV charging) record from a pump/charger receipt that you have already read. Nothing is saved: returns a preview " +
-        "with a confirmation token. Odometer is required and is usually NOT on the receipt: ask the user, or have them send a dashboard photo. " +
+        "with a confirmation token. Odometer is usually NOT on the receipt: ask the user, or have them send a dashboard photo; it may be left " +
+        "out only for vehicles with 'Odometer Optional' on. " +
         "fuelConsumed is in the unit LubeLogger is configured for (gallons or liters; kWh for EVs). Set isFillToFull=false for partial fills, " +
         "missedFuelUp=true if an earlier fill-up was never logged.",
       inputSchema: {
         vehicle: vehicleField,
         date: dateField,
-        odometer: odometerField,
+        odometer: optionalOdometerField,
         fuelConsumed: z.number().positive().max(10_000).describe("Amount of fuel/energy added."),
         cost: moneyField.describe("Total cost as a plain number."),
         isFillToFull: z.boolean().default(true),
@@ -315,7 +343,7 @@ export function registerTools(server: McpServer, deps: Deps): void {
           extraWarnings,
           details: [
             ["Date", args.date],
-            ["Odometer", fmt(args.odometer)],
+            odometerDetail(args.odometer),
             ["Fuel consumed", fmt(args.fuelConsumed)],
             ["Cost", `${args.cost.toFixed(2)} (${unitPrice.toFixed(3)} per unit)`],
             ["Filled to full", args.isFillToFull ? "yes" : "no (partial)"],
@@ -326,9 +354,9 @@ export function registerTools(server: McpServer, deps: Deps): void {
             ["Notes", args.notes || "(none)"],
             ["Tags", args.tags || "(none)"],
           ],
-          buildBody: () => ({
+          buildBody: (_latest, odometer) => ({
             date: args.date,
-            odometer: args.odometer,
+            odometer,
             fuelConsumed: args.fuelConsumed,
             cost: args.cost,
             isFillToFull: args.isFillToFull,

@@ -12,6 +12,7 @@ Every request it sends was checked against the LubeLogger 1.7.4 source: routes, 
 - **Keeps a custom `MCP_PATH` out of the log.** Upstream printed it in its startup line, and for clients that cannot send a bearer token (the Claude app) that path is the only credential.
 - **Patched dependencies**, lockfile only: `body-parser` 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), denial of service) and `fast-uri` 3.1.9 ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) and related).
 - Tests for all of the above in `test/smoke.mjs`, and a `.gitattributes` that keeps line endings LF.
+- **Follows LubeLogger's "Odometer Optional" setting.** Service, repair, upgrade and fuel records for those vehicles can leave the odometer out; it is saved as 0, matching LubeLogger's own form. Upstream required it for every vehicle.
 - A Home Assistant local add-on in `home-assistant/lubelogger_mcp/`. Copy the folder to `/local_apps/` on the HA host. It builds the commit pinned as `REF` in its `Dockerfile`, reads its settings from the add-on's Configuration tab, and drops to the unprivileged `node` user before starting.
 
 ### Pulling changes from upstream
@@ -53,7 +54,7 @@ photo/PDF  ->  Claude reads it  ->  propose_* tool  ->  PREVIEW + warnings + tok
 
 - **Nothing is written by a `propose_*` tool.** It validates, resolves the vehicle, compares against the latest odometer, checks for duplicates, and stores the exact payload under a single-use token (default 30 min).
 - **`commit_record` writes exactly what was previewed**, not re-derived input.
-- **Odometer is required on every record.** Receipts usually lack it, so Claude asks you for it, typed or as a photo of the dashboard.
+- **Odometer is required unless the vehicle has "Odometer Optional" on.** Receipts usually lack it, so Claude asks you for it, typed or as a photo of the dashboard. For odometer-optional vehicles it can be left out and is saved as 0, as LubeLogger's own form does.
 
 ## Tools
 

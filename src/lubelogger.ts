@@ -14,6 +14,8 @@ export interface Vehicle {
   make?: string;
   model?: string;
   licensePlate?: string;
+  /** The vehicle's "Odometer Optional" setting in LubeLogger. */
+  odometerOptional?: boolean;
   [key: string]: unknown;
 }
 

@@ -22,7 +22,7 @@ const freePort = () =>
 // ---------- mock LubeLogger ----------
 const vehicles = [
   { id: 1, year: 2019, make: "Toyota", model: "Tacoma", licensePlate: "ABC123" },
-  { id: 2, year: 2015, make: "Toyota", model: "Sienna", licensePlate: "XYZ789" },
+  { id: 2, year: 2015, make: "Toyota", model: "Sienna", licensePlate: "XYZ789", odometerOptional: true },
   { id: 3, year: 2020, make: "Honda", model: "Civic", licensePlate: "CIV001" },
 ];
 // The "latest" endpoint can lag other record types: Tacoma has a service record and Civic a fuel record above it.
@@ -294,7 +294,25 @@ async function main() {
     assert.ok(r.rejected);
     r = await callOrReject(client, "propose_service_record", { vehicle: 1, date: "2026-10-14", description: "x", cost: 1 });
     assert.ok(r.rejected);
+    assert.match(r.text, /odometer/i);
     pass("rejects invalid dates and a missing odometer");
+
+    // vehicles with "Odometer Optional" on: LubeLogger's own form saves 0 when the field is left blank
+    r = await callOrReject(client, "propose_service_record", { vehicle: "sienna", date: "2026-10-14", description: "Wipers", cost: 24 });
+    assert.ok(!r.rejected, r.text);
+    assert.doesNotMatch(r.text, /LOWER than the latest/);
+    await client.callTool({ name: "commit_record", arguments: { confirmationToken: r.text.match(/Confirmation token: ([0-9a-f]+)/)[1] } });
+    assert.equal(posts.at(-1).path, "/api/vehicle/servicerecords/add");
+    assert.equal(posts.at(-1).vehicleId, 2);
+    assert.equal(posts.at(-1).body.odometer, 0);
+    pass("odometer-optional vehicle: service record without odometer saves 0");
+
+    r = await callOrReject(client, "propose_fuel_record", { vehicle: "sienna", date: "2026-10-15", fuelConsumed: 12, cost: 40 });
+    assert.ok(!r.rejected, r.text);
+    await client.callTool({ name: "commit_record", arguments: { confirmationToken: r.text.match(/Confirmation token: ([0-9a-f]+)/)[1] } });
+    assert.equal(posts.at(-1).path, "/api/vehicle/gasrecords/add");
+    assert.equal(posts.at(-1).body.odometer, 0);
+    pass("odometer-optional vehicle: fuel record without odometer saves 0");
 
     // fuel flow
     r = await callOrReject(client, "propose_fuel_record", {
