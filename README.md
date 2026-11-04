@@ -169,6 +169,10 @@ HOME_ASSISTANT_URL=http://homeassistant:8123
 
 Only Home Assistant admins (`is_admin`) can connect. Access tokens last 1 hour and Claude renews them in the background. A connection stays until it has gone 90 days without use.
 
+**Disconnect.** In Home Assistant, open Profile, then Refresh tokens, and delete the entry. The connection ends at the next hourly refresh. A user who loses admin rights is disconnected at the next refresh too. If Home Assistant is unreachable at that moment, Claude is told to try again later and the connection is kept.
+
+**If it stops working for everyone.** Home Assistant's IP ban (`ip_ban_enabled`) is the one thing to watch: if it ever banned this server's address, every connection would end at its next refresh.
+
 ### Claude Code in Home Assistant mode
 
 Claude Code connects through the same OAuth sign-in, with the plain URL and no header:
@@ -181,10 +185,6 @@ Two things differ from the Claude app:
 
 - Claude Code receives the login on `http://localhost:<port>` on your own machine, so those hosts must be allowed: `ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,localhost,127.0.0.1` (in the add-on, the `allowed_redirect_hosts` option). Entries are bare hostnames, with no scheme or port.
 - Claude Code calls the server from your machine, not from Anthropic's cloud, so it does not work with the Anthropic-only Cloudflare rule below. Use one or the other.
-
-**Disconnect.** In Home Assistant, open Profile, then Refresh tokens, and delete the entry. The connection ends at the next hourly refresh. A user who loses admin rights is disconnected at the next refresh too. If Home Assistant is unreachable at that moment, Claude is told to try again later and the connection is kept.
-
-**If it stops working for everyone.** Home Assistant's IP ban (`ip_ban_enabled`) is the one thing to watch: if it ever banned this server's address, every connection would end at its next refresh.
 
 ## Lock it down with Cloudflare
 
