@@ -23,9 +23,11 @@ export type Connection = {
   lastUsedAt: number;
 };
 
+// Maps, not plain objects: keys come from outside (client_id), and a plain
+// object would answer "constructor" or "__proto__" with inherited members
 type Data = {
-  clients: Record<string, OAuthClientInformationFull>;
-  connections: Record<string, Connection>;
+  clients: Map<string, OAuthClientInformationFull>;
+  connections: Map<string, Connection>;
 };
 
 export function hashToken(t: string): string {
@@ -68,20 +70,21 @@ export class AuthStore {
         throw new Error(`Cannot read ${file}: ${(err as Error).message}`);
     }
 
-    let data: Data = { clients: {}, connections: {} };
+    let data: Data = { clients: new Map(), connections: new Map() };
 
     if (raw !== undefined) {
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
-      } catch (err) {
-        throw new Error(`${file} is not valid JSON: ${(err as Error).message}`);
+      } catch {
+        // the parser's message can quote the file, which holds tokens: never include it
+        throw new Error(`${file} is not valid JSON`);
       }
       if (!isRecord(parsed) || !isRecord(parsed.clients) || !isRecord(parsed.connections))
         throw new Error(`${file} does not have the expected shape (clients and connections objects)`);
       data = {
-        clients: parsed.clients as Data["clients"],
-        connections: parsed.connections as Data["connections"],
+        clients: new Map(Object.entries(parsed.clients)) as Data["clients"],
+        connections: new Map(Object.entries(parsed.connections)) as Data["connections"],
       };
     }
 
@@ -89,25 +92,25 @@ export class AuthStore {
   }
 
   getClient(id: string): OAuthClientInformationFull | undefined {
-    return this.data.clients[id];
+    return this.data.clients.get(id);
   }
 
   async saveClient(client: OAuthClientInformationFull): Promise<void> {
-    this.data.clients[client.client_id] = client;
+    this.data.clients.set(client.client_id, client);
     await this.persist();
   }
 
   async putConnection(c: Connection): Promise<Connection | undefined> {
     let replaced: Connection | undefined;
 
-    for (const existing of Object.values(this.data.connections)) {
+    for (const existing of [...this.data.connections.values()]) {
       if (existing.clientId === c.clientId && existing.person.id === c.person.id) {
         replaced = existing;
-        delete this.data.connections[existing.id];
+        this.data.connections.delete(existing.id);
       }
     }
 
-    this.data.connections[c.id] = c;
+    this.data.connections.set(c.id, c);
     await this.persist();
     return replaced;
   }
@@ -118,7 +121,7 @@ export class AuthStore {
   ): { connection: Connection; stale: boolean } | undefined {
     const hash = hashToken(refreshToken);
 
-    for (const connection of Object.values(this.data.connections)) {
+    for (const connection of this.data.connections.values()) {
       if (connection.clientId !== clientId)
         continue;
 
@@ -137,17 +140,17 @@ export class AuthStore {
   }
 
   async updateConnection(c: Connection): Promise<void> {
-    this.data.connections[c.id] = c;
+    this.data.connections.set(c.id, c);
     await this.persist();
   }
 
   async removeConnection(id: string): Promise<Connection | undefined> {
-    const existing = this.data.connections[id];
+    const existing = this.data.connections.get(id);
 
     if (!existing)
       return undefined;
 
-    delete this.data.connections[id];
+    this.data.connections.delete(id);
     await this.persist();
     return existing;
   }
@@ -160,7 +163,14 @@ export class AuthStore {
   private persist(): Promise<void> {
     const run = this.writes.then(async () => {
       const tmp = `${this.file}.tmp`;
-      await fs.writeFile(tmp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
+      await fs.writeFile(tmp, JSON.stringify(
+        {
+          clients: Object.fromEntries(this.data.clients),
+          connections: Object.fromEntries(this.data.connections),
+        },
+        null,
+        2,
+      ), { mode: 0o600 });
       await fs.rename(tmp, this.file);
     });
     this.writes = run.catch(() => undefined);

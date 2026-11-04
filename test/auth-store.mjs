@@ -140,6 +140,23 @@ await check("an unwritable data dir refuses to open naming the directory", async
   });
 });
 
+await check("keys from outside never hit inherited members", async () => {
+  const dir = await tmp();
+  const s = await AuthStore.open(dir, () => 1000);
+  assert.equal(s.getClient("constructor"), undefined);
+  assert.equal(s.getClient("__proto__"), undefined);
+  assert.equal(s.getClient("toString"), undefined);
+  assert.equal(await s.removeConnection("toString"), undefined);
+  assert.equal(await s.removeConnection("__proto__"), undefined);
+  await s.saveClient({ client_id: "__proto__", redirect_uris: ["https://x.example/cb"] });
+  assert.equal(s.getClient("__proto__")?.client_id, "__proto__");
+  assert.equal(s.getClient("other"), undefined);
+  assert.equal(({}).redirect_uris, undefined);
+  const again = await AuthStore.open(dir, () => 1000);
+  assert.equal(again.getClient("__proto__")?.client_id, "__proto__");
+  assert.equal(again.getClient("constructor"), undefined);
+});
+
 await check("updateConnection and removeConnection persist", async () => {
   const dir = await tmp();
   const s = await AuthStore.open(dir, () => 1000);
