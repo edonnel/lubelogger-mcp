@@ -1,5 +1,5 @@
 name: LubeLogger MCP
-version: "0.3.2-4d1d2c2"
+version: "0.4.0-e9336f5"
 slug: lubelogger_mcp
 description: Lets Claude log service, fuel and odometer records into LubeLogger
 url: https://github.com/edonnel/lubelogger-mcp
@@ -11,8 +11,8 @@ watchdog: http://[HOST]:[PORT:3000]/healthz
 options:
   lubelogger_url: http://local-lubelogger:8080
   lubelogger_api_key: ""
-  mcp_path: ""
 schema:
   lubelogger_url: url
   lubelogger_api_key: password
-  mcp_path: password
+  public_url: url?
+  home_assistant_public_url: url?
