@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveVehicle, vehicleLabel, type RecordKind } from "./lubelogger.js";
-import { KIND_LABEL, fmt, guard, isRealDate, normDate, notesField, num, tagsField, vehicleField, type Deps } from "./tools.js";
+import { KIND_LABEL, NOTES_FORMAT, fmt, guard, isRealDate, normDate, notesField, num, tagsField, vehicleField, type Deps } from "./tools.js";
 
 // ---------- input fields ----------
 
@@ -137,7 +137,7 @@ export function registerRecordTools(server: McpServer, deps: Deps): void {
         fuelConsumed: z.number().positive().max(10_000).optional(),
         isFillToFull: z.boolean().optional(),
         missedFuelUp: z.boolean().optional(),
-        notes: notesField.describe("Replaces the existing notes. Pass an empty string to clear."),
+        notes: notesField.describe(`Replaces the existing notes. Pass an empty string to clear. ${NOTES_FORMAT}`),
         tags: tagsField,
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },

@@ -78,7 +78,18 @@ const optionalOdometerField = odometerField
 
 const moneyField = z.number().min(0).max(1_000_000);
 export const tagsField = z.string().max(200).optional().describe("Space-separated tags, e.g. 'oil-change dealer'.");
-export const notesField = z.string().max(4000).optional();
+// LubeLogger renders notes with its bundled Markdown library when "Use Markdown on Saved Notes" is on. That renderer is strict
+// about tables and joins plain lines into one paragraph, so the layout below is spelled out for Claude.
+export const NOTES_FORMAT =
+  "Write notes in Markdown, laid out like the original document: first a bulleted list of its facts with bold labels (shop and address, " +
+  "invoice or work-order number, insurance and claim, warranty, payment); then a blank line and a table of its line items using the " +
+  "document's own columns, order and wording, one row per line item, never inventing rows or columns; then a blank line and a bulleted " +
+  "list of subtotal, tax and total exactly as printed. LubeLogger's renderer is strict: every table row needs a leading and a trailing |, " +
+  "the separator row needs at least two dashes per cell (|---|--:|), a | inside a cell is written \\|, and plain lines without a list " +
+  "marker run together into one paragraph.";
+
+// an itemized invoice as a Markdown table runs long; LubeLogger itself sets no limit
+export const notesField = z.string().max(10_000).optional();
 const extraFieldsField = z
   .array(z.object({ name: z.string().min(1), value: z.string() }))
   .optional()
@@ -258,7 +269,7 @@ export function registerTools(server: McpServer, deps: Deps): void {
         "Prepare a maintenance record from an invoice, receipt or work order that you have already read (image or PDF). " +
         "Nothing is saved: returns a preview with warnings and a confirmation token. " +
         "recordType: 'service' = scheduled maintenance (oil, filters, tires, brakes); 'repair' = unplanned fix; 'upgrade' = enhancement. " +
-        "Put the shop name and a parts/labor breakdown in notes. Odometer: required unless the vehicle is marked '(odometer optional)' " +
+        "Put the document's details and every line item in notes, laid out as the notes field describes. Odometer: required unless the vehicle is marked '(odometer optional)' " +
         "in list_vehicles, in which case it's a gentle suggestion only (see the odometer field).",
       inputSchema: {
         vehicle: vehicleField,
@@ -267,7 +278,7 @@ export function registerTools(server: McpServer, deps: Deps): void {
         odometer: optionalOdometerField,
         description: z.string().min(1).max(200).describe("Short summary, e.g. 'Oil and filter change'."),
         cost: moneyField.describe("Total cost as a plain number (no currency symbol). Use the invoice total."),
-        notes: notesField.describe("Shop name, parts, labor, invoice number, warranty info."),
+        notes: notesField.describe(NOTES_FORMAT),
         tags: tagsField,
         extraFields: extraFieldsField,
       },
@@ -324,7 +335,7 @@ export function registerTools(server: McpServer, deps: Deps): void {
         missedFuelUp: z.boolean().default(false),
         startingSoc: z.number().int().min(0).max(100).optional().describe("EV only: state of charge % before charging."),
         endingSoc: z.number().int().min(0).max(100).optional().describe("EV only: state of charge % after charging."),
-        notes: notesField.describe("Station name, fuel grade, etc."),
+        notes: notesField.describe(`Station name, fuel grade, etc. ${NOTES_FORMAT}`),
         tags: tagsField,
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },

@@ -342,6 +342,13 @@ async function main() {
     assert.equal(posts.at(-1).body.odometer, 0);
     pass("odometer-optional vehicle: fuel record without odometer saves 0");
 
+    // notes hold the whole invoice as a Markdown table, which runs long
+    r = await callOrReject(client, "propose_service_record", { vehicle: "sienna", date: "2026-10-14", description: "Big invoice", cost: 1, notes: "x".repeat(6000) });
+    assert.ok(!r.rejected, r.text.slice(0, 200));
+    r = await callOrReject(client, "propose_service_record", { vehicle: "sienna", date: "2026-10-14", description: "Too big", cost: 1, notes: "x".repeat(10001) });
+    assert.ok(r.rejected);
+    pass("notes accept a long itemized invoice up to 10,000 characters");
+
     // fuel flow
     r = await callOrReject(client, "propose_fuel_record", {
       vehicle: "tacoma",
