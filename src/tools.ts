@@ -70,9 +70,10 @@ const odometerField = z
 const optionalOdometerField = odometerField
   .optional()
   .describe(
-    "Odometer reading, in the unit LubeLogger is configured for. If the document doesn't show it, ask the user to type it or send a " +
-      "photo of the dashboard. Leave it out only if the user says they don't have it: that is accepted for vehicles with " +
-      "'Odometer Optional' turned on in LubeLogger and saved as 0. Never guess, and never reuse the last known reading.",
+    "Odometer reading, in the unit LubeLogger is configured for. Use the document's reading if it has one; never guess or reuse an old reading. " +
+      "For vehicles marked '(odometer optional)' in list_vehicles it is truly optional: you may mention once that a reading helps track " +
+      "mileage, but don't insist. If the user doesn't offer one, leave it out. It is sent as 0, which LubeLogger stores and shows as " +
+      "no reading (blank), not as zero miles. Other vehicles require it: ask the user to type it or send a dashboard photo.",
   );
 
 const moneyField = z.number().min(0).max(1_000_000);
@@ -134,7 +135,7 @@ interface PreviewArgs {
 /** Preview line for an odometer the user may have left out. */
 const odometerDetail = (odometer: number | undefined): [string, string] => [
   "Odometer",
-  odometer === undefined ? "not recorded (saved as 0, as LubeLogger does for odometer-optional vehicles)" : fmt(odometer),
+  odometer === undefined ? "none (fine for this vehicle; LubeLogger shows it blank)" : fmt(odometer),
 ];
 
 async function buildPreview(a: PreviewArgs): Promise<string> {
@@ -225,7 +226,8 @@ export function registerTools(server: McpServer, deps: Deps): void {
         const rows = await Promise.all(
           vehicles.map(async (v) => {
             const odo = await client.getLatestOdometer(v.id).catch(() => null);
-            return `- id ${v.id}: ${vehicleLabel(v)}, latest odometer: ${odo === null ? "none" : fmt(odo)}`;
+            const optional = v.odometerOptional === true ? " (odometer optional)" : "";
+            return `- id ${v.id}: ${vehicleLabel(v)}, latest odometer: ${odo === null ? "none" : fmt(odo)}${optional}`;
           }),
         );
         return rows.join("\n");
@@ -256,8 +258,8 @@ export function registerTools(server: McpServer, deps: Deps): void {
         "Prepare a maintenance record from an invoice, receipt or work order that you have already read (image or PDF). " +
         "Nothing is saved: returns a preview with warnings and a confirmation token. " +
         "recordType: 'service' = scheduled maintenance (oil, filters, tires, brakes); 'repair' = unplanned fix; 'upgrade' = enhancement. " +
-        "Put the shop name and a parts/labor breakdown in notes. Odometer: ask the user if the document lacks it; it may be left out " +
-        "only for vehicles with 'Odometer Optional' on.",
+        "Put the shop name and a parts/labor breakdown in notes. Odometer: required unless the vehicle is marked '(odometer optional)' " +
+        "in list_vehicles, in which case it's a gentle suggestion only (see the odometer field).",
       inputSchema: {
         vehicle: vehicleField,
         recordType: z.enum(["service", "repair", "upgrade"]).default("service"),
@@ -308,8 +310,8 @@ export function registerTools(server: McpServer, deps: Deps): void {
       title: "Propose fuel record",
       description:
         "Prepare a fuel (or EV charging) record from a pump/charger receipt that you have already read. Nothing is saved: returns a preview " +
-        "with a confirmation token. Odometer is usually NOT on the receipt: ask the user, or have them send a dashboard photo; it may be left " +
-        "out only for vehicles with 'Odometer Optional' on. " +
+        "with a confirmation token. Odometer is usually NOT on the receipt: for most vehicles ask the user or have them send a dashboard photo; " +
+        "for vehicles marked '(odometer optional)' it's a gentle suggestion only (see the odometer field). " +
         "fuelConsumed is in the unit LubeLogger is configured for (gallons or liters; kWh for EVs). Set isFillToFull=false for partial fills, " +
         "missedFuelUp=true if an earlier fill-up was never logged.",
       inputSchema: {

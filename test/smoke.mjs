@@ -203,6 +203,11 @@ async function main() {
     assert.match(lv, /Tacoma.*84,932/);
     pass("list_vehicles shows vehicles with latest odometer across record types");
 
+    // Claude needs to know up front which vehicles can skip the odometer, or it insists on one for every record
+    assert.match(lv, /Sienna.*odometer optional/);
+    assert.doesNotMatch(lv, /Tacoma.*odometer optional/);
+    pass("list_vehicles marks odometer-optional vehicles");
+
     // Same "latest odometer" everywhere, even when a fuel record is above the odometer endpoint (50,801 vs 51,530).
     assert.match(lv, /Civic.*latest odometer: 51,530/);
     assert.match(text(await client.callTool({ name: "get_latest_odometer", arguments: { vehicle: "civic" } })), /latest odometer 51,530/);
