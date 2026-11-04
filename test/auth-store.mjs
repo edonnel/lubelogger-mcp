@@ -114,9 +114,11 @@ await check("expired is true after 90 days unused and false at 89", async () => 
 
 await check("a corrupt oauth.json refuses to open with the file name in the error", async () => {
   const dir = await tmp();
-  await fs.writeFile(path.join(dir, "oauth.json"), "{not json");
+  await fs.writeFile(path.join(dir, "oauth.json"), `{"connections": {"x": {"upstream": {"haRefreshToken": "SECRET-PLANTED-9f3a" oops`);
   await assert.rejects(AuthStore.open(dir), (e) => {
     assert.match(e.message, /oauth\.json/);
+    assert.match(e.message, /not valid JSON/);
+    assert.ok(!e.message.includes("SECRET-PLANTED-9f3a"), "error leaks file content");
     return true;
   });
 });
