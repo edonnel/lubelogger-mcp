@@ -523,6 +523,50 @@ await check("a stale refresh after 60 seconds is rejected", async () => {
   alice = remember(await r3.json());
 });
 
+await check("a refresh token two rotations old is rejected even within 60 seconds", async () => {
+  const t0 = alice.refresh_token;
+  const r1 = await refresh(claude, t0);
+  assert.equal(r1.status, 200);
+  const t1 = remember(await r1.json());
+  const r2 = await refresh(claude, t1.refresh_token);
+  assert.equal(r2.status, 200);
+  alice = remember(await r2.json());
+  clock += 5_000;
+  const old = await refresh(claude, t0);
+  assert.equal(old.status, 400);
+  assert.equal((await old.json()).error, "invalid_grant");
+  // the current token is unaffected
+  const r3 = await refresh(claude, alice.refresh_token);
+  assert.equal(r3.status, 200);
+  alice = remember(await r3.json());
+});
+
+await check("an authorization code redeemed by another client is invalid_grant", async () => {
+  const other = await register();
+  const { code, verifier } = await authorizeAs(claude, "carol");
+  const r = await exchange(other, code, verifier);
+  assert.equal(r.status, 400);
+  const body = await r.json();
+  assert.equal(body.error, "invalid_grant");
+  assert.equal(body.access_token, undefined);
+  // the rightful client can still redeem it
+  const mine = await exchange(claude, code, verifier);
+  assert.equal(mine.status, 200);
+  remember(await mine.json());
+});
+
+await check("a redirect_uri mismatch at the exchange is invalid_grant and ends the upstream session", async () => {
+  const { code, verifier } = await authorizeAs(claude, "carol");
+  const before = stub.cleaned.length;
+  const r = await exchange(claude, code, verifier, "https://claude.example.com/elsewhere");
+  assert.equal(r.status, 400);
+  assert.equal((await r.json()).error, "invalid_grant");
+  assert.equal(stub.cleaned.length, before + 1, "the upstream session behind the code is cleaned up");
+  assert.match(stub.cleaned.at(-1), /^up-carol-/);
+  // and the code is spent
+  assert.equal((await exchange(claude, code, verifier)).status, 400);
+});
+
 await check("an unreachable login method gives 503 and keeps the refresh token", async () => {
   for (const mode of ["unavailable", "throws"]) {
     stub.recheckMode = mode;
