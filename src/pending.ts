@@ -11,6 +11,8 @@ export interface PendingRecord {
   vehicleLabel: string;
   /** Exact body that will be sent to LubeLogger on commit. */
   body: Record<string, unknown>;
+  /** True when body replaces an existing record of this kind instead of adding one. */
+  update?: boolean;
   createdAt: number;
 }
 

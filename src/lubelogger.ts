@@ -172,6 +172,11 @@ export class LubeLoggerClient {
     return asResponse(await this.request("PUT", "/api/vehicle/reminders/update", { body }));
   }
 
+  /** LubeLogger overwrites every field on update, attachments and extra fields included, so body must be the full record. PUT, not POST. */
+  async updateRecord(kind: RecordKind, body: Record<string, unknown>): Promise<OperationResponse> {
+    return asResponse(await this.request("PUT", `/api/vehicle/${PATHS[kind]}/update`, { body }));
+  }
+
   async addRecord(kind: RecordKind, vehicleId: number, body: Record<string, unknown>): Promise<OperationResponse> {
     const data = await this.request("POST", `/api/vehicle/${PATHS[kind]}/add`, { query: { vehicleId }, body });
     return (data && typeof data === "object" ? data : { message: String(data ?? "") }) as OperationResponse;

@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { loadConfig } from "./config.js";
 import { LubeLoggerClient } from "./lubelogger.js";
 import { PendingStore } from "./pending.js";
+import { registerRecordTools } from "./records.js";
 import { registerReminderTools } from "./reminders.js";
 import { registerTools } from "./tools.js";
 
@@ -21,6 +22,8 @@ const INSTRUCTIONS = [
   "For other vehicles it is required: ask the user to type it or send a dashboard photo.",
   "If a vehicle is ambiguous, call list_vehicles and ask.",
   "Reminders (e.g. tire rotation) use the same propose/commit flow: check list_reminders first and prefer propose_reminder_update over a duplicate.",
+  "To correct an existing record, find it with list_records, then call propose_record_update with only the fields that change",
+  "(attachments and everything else are kept) and commit_record after the user confirms.",
 ].join(" ");
 
 function createServer(): McpServer {
@@ -28,6 +31,7 @@ function createServer(): McpServer {
   const deps = { client, pending, ttlMinutes: config.CONFIRM_TTL_MINUTES };
   registerTools(server, deps);
   registerReminderTools(server, deps);
+  registerRecordTools(server, deps);
   return server;
 }
 

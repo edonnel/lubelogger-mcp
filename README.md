@@ -13,6 +13,7 @@ Every request it sends was checked against the LubeLogger 1.7.4 source: routes, 
 - **Patched dependencies**, lockfile only: `body-parser` 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), denial of service) and `fast-uri` 3.1.9 ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) and related).
 - Tests for all of the above in `test/smoke.mjs`, and a `.gitattributes` that keeps line endings LF.
 - **Follows LubeLogger's "Odometer Optional" setting.** Service, repair, upgrade and fuel records for those vehicles can leave the odometer out; it is saved as 0, which LubeLogger shows as a blank odometer, matching its own form. `list_vehicles` marks these vehicles, and Claude treats the reading as a suggestion for them. Upstream required it for every vehicle.
+- **Edits existing records.** `list_records` finds them and `propose_record_update` changes only the fields given, through the same preview-and-confirm flow. LubeLogger's update endpoints overwrite every field, so the update starts from the full record and keeps attachments, extra fields and fuel charge levels. Upstream was add-only.
 - A Home Assistant local add-on in `home-assistant/lubelogger_mcp/`. Copy the folder to `/local_apps/` on the HA host. It builds the commit pinned as `REF` in its `Dockerfile`, reads its settings from the add-on's Configuration tab, and drops to the unprivileged `node` user before starting.
 
 ### Pulling changes from upstream
@@ -68,6 +69,8 @@ photo/PDF  ->  Claude reads it  ->  propose_* tool  ->  PREVIEW + warnings + tok
 | `list_reminders` | A vehicle's reminders with id, urgency, due date/odometer and what's left |
 | `propose_reminder` | New reminder due at a date, an odometer reading, or both (whichever comes first) |
 | `propose_reminder_update` | Change an existing reminder by id, e.g. move "Rotate Tires" forward after a rotation. Unspecified fields are kept |
+| `list_records` | A vehicle's records of one type, newest first, with id, date, odometer, cost and attachment count |
+| `propose_record_update` | Correct an existing service, repair, upgrade, fuel or odometer record by id. Only the given fields change; attachments and everything else are kept |
 | `commit_record` | Save a previously proposed record or reminder by token |
 
 Vehicles can be referenced by id or any part of the name/plate (`tacoma`, `ABC123`). If a name matches more than one vehicle, the tool errors and Claude asks you.
@@ -133,7 +136,7 @@ claude mcp add --transport http lubelogger http://<server>:3000/mcp \
 
 ## Limitations
 
-- Records are add-only. No editing or deleting records (do that in the LubeLogger UI). Reminders can be updated but not deleted.
+- Records and reminders can be added and edited but not deleted (do that in the LubeLogger UI).
 - LubeLogger's API doesn't expose a reminder's recurring settings. Updates leave them as they are; set recurrence in the UI.
 - The original invoice/receipt isn't attached to the record. LubeLogger has `/api/documents/upload` and a per-record `files` field, so this is a feasible follow-up.
 - Pending previews live in memory, so a container restart drops them (just propose again).

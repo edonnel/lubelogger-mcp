@@ -28,8 +28,25 @@ const vehicles = [
 // The "latest" endpoint can lag other record types: Tacoma has a service record and Civic a fuel record above it.
 const latestOdo = { 1: 84900, 2: 120500, 3: 50801 };
 const existing = {
-  servicerecords: { 1: [{ id: 7, date: "2026-10-14", odometer: 84932, description: "Oil change", cost: 89.5 }] },
-  gasrecords: { 3: [{ id: 11, date: "2026-10-12", odometer: "51530", fuelConsumed: 10.2, cost: 38.1 }] },
+  // records carry everything LubeLogger's update endpoints overwrite, so an edit must send it all back unchanged
+  servicerecords: {
+    1: [
+      {
+        id: 7,
+        date: "2026-10-14",
+        odometer: 84932,
+        description: "Oil change",
+        cost: 89.5,
+        notes: "Jiffy Lube",
+        tags: "oil dealer",
+        files: [{ name: "invoice.pdf", location: "/documents/abc123.pdf" }],
+        extraFields: [{ name: "Shop", value: "Jiffy" }],
+      },
+    ],
+  },
+  gasrecords: {
+    3: [{ id: 11, date: "2026-10-12", odometer: "51530", fuelConsumed: 10.2, cost: 38.1, isFillToFull: "True", missedFuelUp: "False", startingSoc: "35", endingSoc: "90", notes: "", tags: "" }],
+  },
   odometerrecords: { 3: [{ id: 12, date: "2026-09-01", initialOdometer: 50000, odometer: 50801 }] },
   // Shaped like LubeLogger 1.7.3: values are strings, dueDate is ToShortDateString() in the invariant culture.
   reminders: {
@@ -85,6 +102,10 @@ const mock = http.createServer((req, res) => {
     });
   };
   if (m && m[2] && req.method === "POST") return write("Record Added");
+  // record updates are PUT-only, like reminders
+  if (/^\/api\/vehicle\/\w+records\/update$/.test(url.pathname)) {
+    return req.method === "PUT" ? write("Record Updated") : send(405, { success: false, message: "Method Not Allowed" });
+  }
   // The real update endpoint is PUT-only; POST returns 405.
   if (url.pathname === "/api/vehicle/reminders/update") {
     return req.method === "PUT" ? write("Reminder Record Updated") : send(405, { success: false, message: "Method Not Allowed" });
@@ -187,15 +208,17 @@ async function main() {
     assert.deepEqual(tools, [
       "commit_record",
       "get_latest_odometer",
+      "list_records",
       "list_reminders",
       "list_vehicles",
       "propose_fuel_record",
       "propose_odometer_record",
+      "propose_record_update",
       "propose_reminder",
       "propose_reminder_update",
       "propose_service_record",
     ]);
-    pass("lists all 9 tools");
+    pass("lists all 11 tools");
 
     const lv = text(await client.callTool({ name: "list_vehicles", arguments: {} }));
     assert.match(lv, /Tacoma/);
@@ -441,6 +464,54 @@ async function main() {
     r = await callOrReject(client, "propose_reminder_update", { vehicle: "tacoma", reminderId: 3 });
     assert.match(r.text, /Nothing changes/);
     pass("update preserves the unused due field and warns on past-due / no-op changes");
+
+    // ---------- editing existing records ----------
+    r = await callOrReject(client, "list_records", { vehicle: "tacoma", recordType: "service" });
+    assert.ok(!r.rejected, r.text);
+    assert.match(r.text, /id 7.*2026-10-14.*Oil change/);
+    assert.match(r.text, /1 attachment/);
+    pass("list_records finds a vehicle's records with ids and attachment counts");
+
+    const writesBeforeEdit = posts.length;
+    r = await callOrReject(client, "propose_record_update", { vehicle: "tacoma", recordType: "service", recordId: 7, cost: 95 });
+    assert.ok(!r.rejected, r.text);
+    assert.match(r.text, /Cost: 89\.50 -> 95\.00 \(CHANGED\)/);
+    assert.match(r.text, /1 attachment/);
+    assert.equal(posts.length, writesBeforeEdit, "propose must not write");
+    await client.callTool({ name: "commit_record", arguments: { confirmationToken: tokenOf(r.text) } });
+    assert.equal(posts.at(-1).method, "PUT");
+    assert.equal(posts.at(-1).path, "/api/vehicle/servicerecords/update");
+    assert.equal(posts.at(-1).body.id, 7);
+    assert.equal(posts.at(-1).body.cost, 95);
+    assert.equal(posts.at(-1).body.description, "Oil change");
+    assert.equal(posts.at(-1).body.odometer, 84932);
+    assert.equal(posts.at(-1).body.notes, "Jiffy Lube");
+    assert.equal(posts.at(-1).body.tags, "oil dealer");
+    assert.deepEqual(posts.at(-1).body.files, [{ name: "invoice.pdf", location: "/documents/abc123.pdf" }]);
+    assert.deepEqual(posts.at(-1).body.extraFields, [{ name: "Shop", value: "Jiffy" }]);
+    pass("record update changes only the given field and keeps attachments, extra fields, notes and tags");
+
+    r = await callOrReject(client, "propose_record_update", { vehicle: "civic", recordType: "fuel", recordId: 11, notes: "Costco" });
+    assert.ok(!r.rejected, r.text);
+    await client.callTool({ name: "commit_record", arguments: { confirmationToken: tokenOf(r.text) } });
+    assert.equal(posts.at(-1).path, "/api/vehicle/gasrecords/update");
+    assert.equal(posts.at(-1).body.notes, "Costco");
+    assert.equal(posts.at(-1).body.startingSoc, "35");
+    assert.equal(posts.at(-1).body.endingSoc, "90");
+    assert.equal(posts.at(-1).body.fuelConsumed, 10.2);
+    assert.equal(posts.at(-1).body.isFillToFull, "True");
+    pass("fuel record update keeps fuel amount, fill flags and charge levels");
+
+    r = await callOrReject(client, "propose_record_update", { vehicle: "tacoma", recordType: "service", recordId: 99, cost: 1 });
+    assert.ok(r.rejected);
+    assert.match(r.text, /id 7/);
+    pass("record update rejects an unknown id and lists the real ones");
+
+    r = await callOrReject(client, "propose_record_update", { vehicle: "civic", recordType: "fuel", recordId: 11, description: "x" });
+    assert.ok(r.rejected);
+    r = await callOrReject(client, "propose_record_update", { vehicle: "tacoma", recordType: "service", recordId: 7 });
+    assert.match(r.text, /Nothing changes/);
+    pass("record update refuses fields the record type doesn't have and warns on no-op edits");
 
     await client.close();
 

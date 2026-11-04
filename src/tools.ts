@@ -436,8 +436,11 @@ export function registerTools(server: McpServer, deps: Deps): void {
               ? await client.addReminder(rec.vehicleId, rec.body)
               : rec.kind === "reminderUpdate"
                 ? await client.updateReminder(rec.body)
-                : await client.addRecord(rec.kind, rec.vehicleId, rec.body);
-          return `Saved ${KIND_LABEL[rec.kind].toLowerCase()} for ${rec.vehicleLabel}. LubeLogger: ${res.message ?? "OK"}`;
+                : rec.update
+                  ? await client.updateRecord(rec.kind, rec.body)
+                  : await client.addRecord(rec.kind, rec.vehicleId, rec.body);
+          const verb = rec.update ? "Updated" : "Saved";
+          return `${verb} ${KIND_LABEL[rec.kind].toLowerCase()} for ${rec.vehicleLabel}. LubeLogger: ${res.message ?? "OK"}`;
         } catch (err) {
           // Definite rejection: nothing was written, so allow a retry with the same token.
           if (err instanceof LubeLoggerError && err.definitive) pending.restore(rec);
