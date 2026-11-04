@@ -1,0 +1,18 @@
+name: LubeLogger MCP
+version: "0.1.0-ab43748"
+slug: lubelogger_mcp
+description: Lets Claude log service, fuel and odometer records into LubeLogger
+url: https://github.com/edonnel/lubelogger-mcp
+arch:
+  - amd64
+startup: application
+boot: auto
+watchdog: http://[HOST]:[PORT:3000]/healthz
+options:
+  lubelogger_url: http://local-lubelogger:8080
+  lubelogger_api_key: ""
+  mcp_path: ""
+schema:
+  lubelogger_url: url
+  lubelogger_api_key: password
+  mcp_path: password

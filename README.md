@@ -12,6 +12,7 @@ Every request it sends was checked against the LubeLogger 1.7.4 source: routes, 
 - **Keeps a custom `MCP_PATH` out of the log.** Upstream printed it in its startup line, and for clients that cannot send a bearer token (the Claude app) that path is the only credential.
 - **Patched dependencies**, lockfile only: `body-parser` 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), denial of service) and `fast-uri` 3.1.9 ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) and related).
 - Tests for all of the above in `test/smoke.mjs`, and a `.gitattributes` that keeps line endings LF.
+- A Home Assistant local add-on in `home-assistant/lubelogger_mcp/`. Copy the folder to `/local_apps/` on the HA host. It builds the commit pinned as `REF` in its `Dockerfile`, reads its settings from the add-on's Configuration tab, and drops to the unprivileged `node` user before starting.
 
 ### Pulling changes from upstream
 
