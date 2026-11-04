@@ -121,21 +121,22 @@ There is **no test-only login switch in production code**: tests inject a stub `
   - `add(rec)` gains a required `owner: string`.
   - `take(token, owner)` returns `undefined` when `owner` doesn't match, leaving the record in place.
   - Tools pass `extra.authInfo?.extra?.personId ?? "token"`.
+- Produces in `src/app.ts`: `createApp(config: Config, deps?: { loginMethod?: LoginMethod; now?: () => number }): Promise<{ app: express.Express; close(): Promise<void> }>` builds the whole server (today's token-mode routes, or OAuth plus `/mcp`). `src/index.ts` only loads the config, calls `createApp` without `deps`, and listens. In `homeassistant` mode without an injected method it constructs Task 4's `HomeAssistantLogin`.
 
-- [ ] **Step 1: Write failing tests in `test/oauth-ha.mjs`.** Start the built server with `AUTH_MODE=homeassistant` and a `FAKE_LOGIN=allow:alice,deny:bob` env var. That env var is honoured only when `NODE_ENV=test`, and it swaps in a stub `LoginMethod` that logs in the named person on `/login/callback?as=<name>`. Drive the flow with plain `fetch` (`redirect: "manual"`): DCR at `/register`, `/authorize` with PKCE, follow to `/login/callback`, then `/token`. Assertions:
+- [ ] **Step 1: Write failing tests in `test/oauth-ha.mjs`.** Import `createApp` from `../dist/app.js`, build it with `AUTH_MODE: "homeassistant"`, a temp `DATA_DIR`, a controllable clock, and a stub `LoginMethod` whose `start` redirects to `/login/callback?state=<loginState>&as=<name>` and whose `finish` allows `alice` and `carol` and refuses `bob`. Listen on a free port and drive the flow with plain `fetch` (`redirect: "manual"`): DCR at `/register`, `/authorize` with PKCE, follow to `/login/callback`, then `/token`. Assertions:
   - `GET /mcp without a token is 401 with a resource_metadata hint` (`WWW-Authenticate` matches `/resource_metadata=/`)
   - `discovery documents are served`: `/.well-known/oauth-authorization-server` has `issuer` equal to the public URL and lists `registration_endpoint`.
   - `an allowed person gets tokens and can list tools`: `tools/list` with the Bearer token returns 12 tools.
   - `a refused person gets a 403 page and no code`
   - `refresh rotates the token; the old one works only within 60 seconds and gives the same pair`
-  - `a stale refresh after 60 seconds is rejected` (the server reads `TEST_CLOCK_OFFSET_MS` when `NODE_ENV=test`)
+  - `a stale refresh after 60 seconds is rejected` (advance the injected clock)
   - `a second login for the same client and person replaces the first connection`
   - `revoking the refresh token ends the connection`
-  - `connections survive a restart`: refresh works after restarting the server on the same `DATA_DIR`; the old access token gets 401.
+  - `connections survive a restart`: close the app and build a new one on the same `DATA_DIR`; refresh works, and the old access token gets 401.
   - `a confirmation proposed by alice cannot be committed by carol`: carol gets "Unknown or expired confirmation token", and alice can still commit it.
-  - `no token or code appears in the server log`: capture stderr and assert that none of the issued access, refresh or code values appear.
-- [ ] **Step 2: Run `npm run build && node test/oauth-ha.mjs`.** Expected: FAIL at the first assertion (no auth routes).
-- [ ] **Step 3: Implement the files above.** In `src/index.ts`, branch on `config.AUTH_MODE`: `token` keeps today's code path unchanged; `homeassistant` opens `AuthStore`, builds the method (a stub when `NODE_ENV=test` and `FAKE_LOGIN` is set, otherwise Task 4's class), mounts OAuth, and serves MCP at `/mcp` behind the bearer middleware.
+  - `logins are logged by name, never with a token or code`: capture `console.error` output while the tests run; it includes `alice` for a login and `bob` for a refusal, and none of the issued access, refresh or code values appear.
+- [ ] **Step 2: Run `npm run build && node test/oauth-ha.mjs`.** Expected: FAIL, `createApp` not found.
+- [ ] **Step 3: Implement the files above.** Move today's server setup from `src/index.ts` into `createApp`. `token` mode keeps exactly today's routes; `homeassistant` mode opens `AuthStore`, uses the injected method or Task 4's class, mounts OAuth, and serves MCP at `/mcp` behind the bearer middleware. Production code contains no test-only login switch.
 - [ ] **Step 4: Run `npm test`.** Expected: all smoke, config, store and oauth checks pass.
 - [ ] **Step 5: Commit** (message: "Add the OAuth provider with pluggable login methods").
 
