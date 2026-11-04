@@ -1,5 +1,5 @@
 name: LubeLogger MCP
-version: "0.3.0-bed06f8"
+version: "0.3.2-4d1d2c2"
 slug: lubelogger_mcp
 description: Lets Claude log service, fuel and odometer records into LubeLogger
 url: https://github.com/edonnel/lubelogger-mcp
