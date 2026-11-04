@@ -110,7 +110,7 @@ cp .env.example .env
 | `HOME_ASSISTANT_PUBLIC_URL` | unset | Home Assistant mode only, required. Home Assistant's address as your browser sees it, no path, e.g. `https://ha.example.com` |
 | `HOME_ASSISTANT_URL` | unset | Home Assistant mode only, required. Home Assistant's address as this server reaches it, no path, e.g. `http://homeassistant:8123` inside the add-on network |
 | `DATA_DIR` | `./data` | Home Assistant mode. Holds `oauth.json` with the registered clients and connections. Keep it private and back it up |
-| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | Home Assistant mode. Hosts a login code may be sent back to, comma-separated. Only these hosts can register as clients |
+| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | Home Assistant mode. Hosts a login code may be sent back to, comma-separated bare hostnames with no scheme or port. Only these hosts can register as clients. Add `localhost,127.0.0.1` for Claude Code |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | |
 | `CONFIRM_TTL_MINUTES` | `30` | How long a preview token stays valid |
 | `REQUEST_TIMEOUT_MS` | `15000` | Timeout for LubeLogger calls |
@@ -124,16 +124,18 @@ docker compose up -d --build
 curl http://localhost:3000/healthz   # {"status":"ok"}
 ```
 
-Without Docker: `npm ci && npm run build && npm start` (Node 22 or newer, which provides the global `WebSocket` the Home Assistant mode uses).
+Without Docker: `npm ci && npm run build && npm start` (Node 22.4 or newer, which provides the global `WebSocket` the Home Assistant mode uses).
 
 ### 4. Connect Claude
 
-**Claude Code** (works for anything on your LAN or Tailscale):
+**Claude Code**, token mode (works for anything on your LAN or Tailscale):
 
 ```bash
 claude mcp add --transport http lubelogger http://<server>:3000/mcp \
   --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
 ```
+
+In Home Assistant mode there is no bearer token: Claude Code signs in through OAuth like the app does. See [Claude Code in Home Assistant mode](#claude-code-in-home-assistant-mode).
 
 **Claude app / claude.ai custom connector:** as far as I know, remote connectors are called from Anthropic's cloud, not from your phone or LAN. That means the URL must be reachable over public HTTPS (reverse proxy, Cloudflare Tunnel, Tailscale Funnel). Check Anthropic's current connector docs before relying on this, since it changes. The connector UI doesn't take a static bearer header (it supports OAuth or none), so there are two routes:
 
@@ -155,9 +157,9 @@ HOME_ASSISTANT_URL=http://homeassistant:8123
 
 - The endpoint is fixed at `/mcp`. The server refuses to start if `MCP_AUTH_TOKEN` or a custom `MCP_PATH` is also set.
 - `PUBLIC_URL` and `HOME_ASSISTANT_PUBLIC_URL` are what a browser sees. `HOME_ASSISTANT_URL` is what this server uses to talk to Home Assistant, so inside the add-on network it can be a plain internal address.
-- The browser paths `/authorize`, `/login` and `/login/callback` must be reachable through your reverse proxy or tunnel, along with `/mcp`.
+- Besides `/mcp`, the server answers the OAuth endpoints that Claude's servers call (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `/register`, `/token` and `/revoke`) and the browser paths `/authorize`, `/login` and `/login/callback`. All of them must be reachable through your reverse proxy or tunnel.
 - `DATA_DIR` holds `oauth.json`, the registered clients and connections. Keep it private and back it up. Losing it means every connection has to be made again.
-- Node 22 or newer is required (the global `WebSocket`).
+- Node 22.4 or newer is required (the global `WebSocket`).
 
 **Connect Claude.**
 
@@ -167,13 +169,26 @@ HOME_ASSISTANT_URL=http://homeassistant:8123
 
 Only Home Assistant admins (`is_admin`) can connect. Access tokens last 1 hour and Claude renews them in the background. A connection stays until it has gone 90 days without use.
 
+### Claude Code in Home Assistant mode
+
+Claude Code connects through the same OAuth sign-in, with the plain URL and no header:
+
+```bash
+claude mcp add --transport http lubelogger https://mcp.example.com/mcp
+```
+
+Two things differ from the Claude app:
+
+- Claude Code receives the login on `http://localhost:<port>` on your own machine, so those hosts must be allowed: `ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,localhost,127.0.0.1` (in the add-on, the `allowed_redirect_hosts` option). Entries are bare hostnames, with no scheme or port.
+- Claude Code calls the server from your machine, not from Anthropic's cloud, so it does not work with the Anthropic-only Cloudflare rule below. Use one or the other.
+
 **Disconnect.** In Home Assistant, open Profile, then Refresh tokens, and delete the entry. The connection ends at the next hourly refresh. A user who loses admin rights is disconnected at the next refresh too. If Home Assistant is unreachable at that moment, Claude is told to try again later and the connection is kept.
 
 **If it stops working for everyone.** Home Assistant's IP ban (`ip_ban_enabled`) is the one thing to watch: if it ever banned this server's address, every connection would end at its next refresh.
 
 ## Lock it down with Cloudflare
 
-If the server is public through Cloudflare, you can have Cloudflare refuse everything that does not come from Anthropic's cloud. It is optional once OAuth is on, because the sign-in already protects `/mcp`. In token mode with a secret path it is the main extra protection, since the path is the only credential.
+If the server is public through Cloudflare, you can have Cloudflare refuse requests that do not come from Anthropic's cloud, apart from the browser sign-in paths. It is optional once OAuth is on, because the sign-in already protects `/mcp`. In token mode with a secret path it is the main extra protection, since the path is the only credential. It rules out Claude Code, which calls from your own machine.
 
 In the Cloudflare dashboard, open the zone, then **Security → WAF → Custom rules**, and create a rule with action **Block** and this expression (replace `mcp.example.com` with your host):
 
@@ -182,6 +197,7 @@ In the Cloudflare dashboard, open the zone, then **Security → WAF → Custom r
 ```
 
 - The two ranges are Anthropic's published addresses, listed on [Anthropic's IP addresses page](https://docs.anthropic.com/en/api/ip-addresses). They can change, so check that page again if Claude stops reaching the server.
+- The OAuth endpoints that Claude's servers call (`/.well-known/…`, `/register`, `/token`, `/revoke`) come from Anthropic's addresses, so the IP clause already lets them through.
 - The path clause leaves the browser sign-in paths open, because you reach them from your own browser. In token mode there is no sign-in, so drop the last clause: `(http.host eq "mcp.example.com" and not ip.src in {160.79.104.0/21 153.61.208.0/20})`.
 - To check it, request the connector URL from outside, for example `curl -i https://mcp.example.com/mcp` from your own machine. It should answer 403. Connecting from Claude should still work.
 
