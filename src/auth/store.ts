@@ -155,6 +155,11 @@ export class AuthStore {
     return existing;
   }
 
+  /** A snapshot of every connection, safe to iterate while connections are removed. */
+  connections(): Connection[] {
+    return [...this.data.connections.values()];
+  }
+
   expired(c: Connection): boolean {
     return this.now() - c.lastUsedAt > IDLE_EXPIRY_MS;
   }

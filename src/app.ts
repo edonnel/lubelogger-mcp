@@ -93,6 +93,8 @@ export async function createApp(
       allowedRedirectHosts: config.ALLOWED_REDIRECT_HOSTS,
       publicUrl,
     });
+    // connections unused for 90 days go now and hourly after, not only when one is presented again
+    await provider.startPurging();
     endpoint = OAUTH_ENDPOINT;
     guard = mountOAuth(app, { publicUrl, provider });
     close = () => provider.close();

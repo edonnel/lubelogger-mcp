@@ -23,12 +23,16 @@ import { hashToken, REFRESH_GRACE_MS, type AuthStore, type Connection, type Pers
 export const ACCESS_TOKEN_TTL_MS = 60 * 60_000;
 export const LOGIN_STATE_TTL_MS = 10 * 60_000;
 export const CODE_TTL_MS = 10 * 60_000;
+/** How often connections unused for 90 days are looked for and removed. */
+export const PURGE_INTERVAL_MS = 60 * 60_000;
 
 /** Binds a login to the browser that saw the approval page. Path=/login covers /login and /login/callback. */
 const LOGIN_COOKIE = "lm_login";
 const COOKIE_ATTRIBUTES = "HttpOnly; Secure; SameSite=Lax; Path=/login";
 
 const EXPIRED_LINK = "This login link has expired, start again from Claude.";
+
+const EXPIRED_UNUSED = "expired after 90 days unused";
 
 export const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com"];
 
@@ -150,6 +154,12 @@ export class LoginProvider implements OAuthServerProvider {
   // the origin a browser posting the approval form reports, when it reports one
   private readonly publicOrigin: string | undefined;
 
+  private lastPurge: number;
+
+  private purging: Promise<void> | undefined;
+
+  private purgeTimer: NodeJS.Timeout | undefined;
+
   constructor(
     private readonly store: AuthStore,
     private readonly method: LoginMethod,
@@ -158,6 +168,7 @@ export class LoginProvider implements OAuthServerProvider {
   ) {
     this.allowedRedirectHosts = opts.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS;
     this.publicOrigin = opts.publicUrl ? new URL(opts.publicUrl).origin : undefined;
+    this.lastPurge = this.now();
     this.clientsStore = {
       getClient: (id) => store.getClient(id),
       registerClient: async (client) => {
@@ -350,7 +361,7 @@ export class LoginProvider implements OAuthServerProvider {
     const { connection, stale } = found;
 
     if (this.store.expired(connection)) {
-      await this.end(connection, "expired after 90 days without use");
+      await this.end(connection, EXPIRED_UNUSED);
       throw new InvalidGrantError("Refresh token expired");
     }
 
@@ -431,8 +442,41 @@ export class LoginProvider implements OAuthServerProvider {
     if (found) await this.end(found.connection, "revoked");
   }
 
+  /**
+   * Removes every connection unused for 90 days and ends its upstream session. A connection Claude abandoned
+   * (say, after the connector was added again under a new client) is never presented again, so checking
+   * on refresh alone would keep its upstream session forever.
+   */
+  purgeExpired(): Promise<void> {
+    this.lastPurge = this.now();
+    // one run at a time; .finally always runs later, so the next call starts a fresh run
+    this.purging ??= this.purgeOnce().finally(() => {
+      this.purging = undefined;
+    });
+    return this.purging;
+  }
+
+  private async purgeOnce(): Promise<void> {
+    try {
+      for (const connection of this.store.connections())
+        if (this.store.expired(connection)) await this.end(connection, EXPIRED_UNUSED);
+    } catch (err) {
+      log(`purging expired connections failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    }
+  }
+
+  /** Purges now, then every PURGE_INTERVAL_MS until close(), so an idle server still lets go of old sessions. */
+  async startPurging(): Promise<void> {
+    await this.purgeExpired();
+    this.purgeTimer = setInterval(() => void this.purgeExpired(), PURGE_INTERVAL_MS);
+    this.purgeTimer.unref();
+  }
+
   /** Called on shutdown: sessions behind codes that were never exchanged would otherwise be orphaned. */
   async close(): Promise<void> {
+    if (this.purgeTimer) clearInterval(this.purgeTimer);
+    this.purgeTimer = undefined;
+    await this.purging;
     const pending = [...this.codes.values()];
     this.codes.clear();
     this.states.clear();
@@ -463,9 +507,10 @@ export class LoginProvider implements OAuthServerProvider {
     };
   }
 
-  /** Removes a connection, its access tokens and its upstream session. */
+  /** Removes a connection, its access tokens and its upstream session. Only the first of two racing calls acts. */
   private async end(connection: Connection, why: string): Promise<void> {
-    await this.store.removeConnection(connection.id);
+    const removed = await this.store.removeConnection(connection.id);
+    if (!removed) return;
     this.forget(connection.id);
     await this.safeCleanup(connection.upstream, connection.person);
     log(`disconnected ${who(connection.person)} (${why})`);
@@ -495,5 +540,6 @@ export class LoginProvider implements OAuthServerProvider {
     }
     for (const [key, g] of this.access) if (g.expiresAt <= t) this.access.delete(key);
     for (const [key, r] of this.recent) if (t - r.rotatedAt > REFRESH_GRACE_MS) this.recent.delete(key);
+    if (t - this.lastPurge >= PURGE_INTERVAL_MS) void this.purgeExpired();
   }
 }

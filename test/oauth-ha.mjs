@@ -623,6 +623,36 @@ await check("a connection unused for 90 days expires", async () => {
   assert.equal(stub.cleaned.length, before + 1);
 });
 
+const storedConnections = async () =>
+  Object.values(JSON.parse(await fs.readFile(path.join(dataDir, "oauth.json"), "utf8")).connections);
+
+await check("expired connections that are never presented again are purged at startup", async () => {
+  // every connection left from the tests above is now more than 90 days unused, and none is presented again
+  const left = await storedConnections();
+  assert.ok(left.length > 0);
+  const before = stub.cleaned.length;
+  await stop();
+  await start();
+  assert.equal(stub.cleaned.length, before + left.length, "each purged connection's upstream is cleaned up");
+  for (const c of left) assert.ok(stub.cleaned.includes(c.upstream.session));
+  assert.deepEqual(await storedConnections(), []);
+  assert.ok(logs.some((l) => /disconnected "(alice|carol)" \(expired after 90 days unused\)/.test(l)));
+});
+
+await check("expired connections are purged by the periodic sweep", async () => {
+  const carol = await login(claude, "carol");
+  assert.equal((await storedConnections()).length, 1);
+  const before = stub.cleaned.length;
+  clock += 91 * DAY;
+  // any browser request sweeps; the purge runs in the background
+  await openApproval(claude, "alice");
+  for (let i = 0; i < 50 && stub.cleaned.length === before; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(stub.cleaned.length, before + 1);
+  assert.match(stub.cleaned.at(-1), /^up-carol-/);
+  assert.deepEqual(await storedConnections(), []);
+  assert.equal((await refresh(claude, carol.refresh_token)).status, 400);
+});
+
 await check("refresh tokens are stored hashed", async () => {
   const raw = await fs.readFile(path.join(dataDir, "oauth.json"), "utf8");
   for (const s of secrets) assert.ok(!raw.includes(s), "no issued secret in the data file");
