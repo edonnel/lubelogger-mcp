@@ -1,5 +1,5 @@
 # builds the reviewed commit of the fork; to update, change REF here and version in config.yaml
-ARG REF=e9336f55f17acd42afb6d0de185b6b2641e395c4
+ARG REF=68e2fb8207d05f9973d8cb6830151c3945894742
 
 FROM node:22-alpine AS build
 ARG REF
