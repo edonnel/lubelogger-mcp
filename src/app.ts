@@ -4,6 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import express, { type NextFunction, type Request, type RequestHandler, type Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { HomeAssistantLogin } from "./auth/homeassistant.js";
 import type { LoginMethod } from "./auth/login-method.js";
 import { LoginProvider } from "./auth/provider.js";
 import { mountOAuth } from "./auth/routes.js";
@@ -66,15 +67,31 @@ export async function createApp(
     endpoint = config.MCP_PATH;
     guard = tokenGuard(config.MCP_AUTH_TOKEN);
   } else if (config.AUTH_MODE === "homeassistant") {
-    if (!config.PUBLIC_URL) throw new Error("PUBLIC_URL is required when AUTH_MODE is homeassistant");
-    // Task 4 replaces this with the Home Assistant login method
-    const method = deps.loginMethod;
-    if (!method) throw new Error("Home Assistant login is not available in this build (AUTH_MODE=homeassistant)");
+    const publicUrl = config.PUBLIC_URL;
+    if (!publicUrl) throw new Error("PUBLIC_URL is required when AUTH_MODE is homeassistant");
+    if (!config.HOME_ASSISTANT_PUBLIC_URL || !config.HOME_ASSISTANT_URL)
+      throw new Error("HOME_ASSISTANT_PUBLIC_URL and HOME_ASSISTANT_URL are required when AUTH_MODE is homeassistant");
+    const method =
+      deps.loginMethod ??
+      new HomeAssistantLogin({
+        publicUrl,
+        haPublicUrl: config.HOME_ASSISTANT_PUBLIC_URL,
+        haUrl: config.HOME_ASSISTANT_URL,
+      });
+
+    // HA fetches its client ID (PUBLIC_URL + "/") to show the app's name and find its redirect URI
+    const clientPage =
+      "<!doctype html><html><head><meta charset=\"utf-8\"><title>LubeLogger MCP</title>" +
+      `<link rel="redirect_uri" href="${escapeAttr(`${publicUrl}/login/callback`)}"></head>` +
+      "<body><h1>LubeLogger MCP</h1><p>Connect from Claude to log vehicle maintenance into LubeLogger.</p></body></html>";
+    app.get("/", (_req, res) => {
+      res.type("html").send(clientPage);
+    });
 
     const store = await AuthStore.open(config.DATA_DIR, deps.now);
     const provider = new LoginProvider(store, method, deps.now, { allowedRedirectHosts: config.ALLOWED_REDIRECT_HOSTS });
     endpoint = OAUTH_ENDPOINT;
-    guard = mountOAuth(app, { publicUrl: config.PUBLIC_URL, provider });
+    guard = mountOAuth(app, { publicUrl, provider });
     close = () => provider.close();
   } else {
     throw new Error(`AUTH_MODE ${String(config.AUTH_MODE)} is not available in this version`);
@@ -106,6 +123,10 @@ export async function createApp(
   app.delete(endpoint, guard, methodNotAllowed);
 
   return { app, close };
+}
+
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 // Token mode, unchanged: the bearer token when one is set; otherwise config has already required a secret MCP_PATH.

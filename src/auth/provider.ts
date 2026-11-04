@@ -52,6 +52,11 @@ function log(message: string): void {
   console.error(`[auth] ${message}`);
 }
 
+/** A person's name for a log line, quoted and escaped so a name cannot forge or break a line. */
+function who(person: Person | undefined): string {
+  return JSON.stringify(person?.name ?? "unknown");
+}
+
 const HTML_ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" };
 
 function escapeHtml(s: string): string {
@@ -202,7 +207,7 @@ export class LoginProvider implements OAuthServerProvider {
       }
 
       if ("refused" in result) {
-        log(`login refused: ${result.refused}`);
+        log(`login refused for ${who(result.person)}: ${JSON.stringify(result.refused)}`);
         page(res, 403, "Not allowed", result.refused);
         return;
       }
@@ -215,7 +220,7 @@ export class LoginProvider implements OAuthServerProvider {
         upstream: result.upstream,
         createdAt: this.now(),
       });
-      log(`login by ${result.person.name}`);
+      log(`login by ${who(result.person)}`);
 
       const target = new URL(entry.params.redirectUri);
       target.searchParams.set("code", code);
@@ -260,10 +265,10 @@ export class LoginProvider implements OAuthServerProvider {
     if (replaced) {
       this.forget(replaced.id);
       await this.safeCleanup(replaced.upstream, replaced.person);
-      log(`connection for ${replaced.person.name} replaced by a new login`);
+      log(`connection for ${who(replaced.person)} replaced by a new login`);
     }
 
-    log(`connected ${entry.person.name}`);
+    log(`connected ${who(entry.person)}`);
     return this.issue(connection, refreshToken);
   }
 
@@ -301,11 +306,11 @@ export class LoginProvider implements OAuthServerProvider {
       check = await this.method.recheck(connection.upstream);
     } catch (err) {
       check = { ok: false, reason: "unavailable" };
-      log(`re-check for ${connection.person.name} failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      log(`re-check for ${who(connection.person)} failed: ${err instanceof Error ? err.message : "unknown error"}`);
     }
 
     if (!check.ok && check.reason === "unavailable") {
-      log(`login method unavailable while refreshing ${connection.person.name}; refresh token kept`);
+      log(`login method unavailable while refreshing ${who(connection.person)}; refresh token kept`);
       throw new TemporarilyUnavailableError("The login service is unavailable, try again shortly");
     }
 
@@ -402,7 +407,7 @@ export class LoginProvider implements OAuthServerProvider {
     await this.store.removeConnection(connection.id);
     this.forget(connection.id);
     await this.safeCleanup(connection.upstream, connection.person);
-    log(`disconnected ${connection.person.name} (${why})`);
+    log(`disconnected ${who(connection.person)} (${why})`);
   }
 
   private forget(connectionId: string): void {
@@ -414,7 +419,7 @@ export class LoginProvider implements OAuthServerProvider {
     try {
       await this.method.cleanup(upstream);
     } catch (err) {
-      log(`cleanup for ${person.name} failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      log(`cleanup for ${who(person)} failed: ${err instanceof Error ? err.message : "unknown error"}`);
     }
   }
 

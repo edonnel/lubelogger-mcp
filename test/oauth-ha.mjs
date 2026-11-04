@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { WebSocketServer } from "ws";
 import { createApp } from "../dist/app.js";
 import { validateConfig } from "../dist/config.js";
 
@@ -77,7 +78,8 @@ const stub = {
   },
   async finish(req) {
     const name = String(req.query.as);
-    if (name !== "alice" && name !== "carol") return { refused: `${name} is not allowed <here> & "nowhere"` };
+    if (name !== "alice" && name !== "carol")
+      return { refused: `${name} is not allowed <here> & "nowhere"`, person: { id: `id-${name}`, name } };
     this.sessions++;
     return { person: { id: `id-${name}`, name }, upstream: { session: `up-${name}-${this.sessions}`, name } };
   },
@@ -191,8 +193,8 @@ async function beginLogin(client, name) {
 }
 
 // the whole browser leg: /authorize, the login method, /login/callback; returns the code
-async function authorizeAs(client, name) {
-  const { callback, verifier } = await beginLogin(client, name);
+async function authorizeAs(client, name, begin = beginLogin) {
+  const { callback, verifier } = await begin(client, name);
   const r = await get(callback);
   assert.equal(r.status, 302, await r.text());
   const back = new URL(r.headers.get("location"));
@@ -220,8 +222,8 @@ function remember(tokens) {
   return tokens;
 }
 
-async function login(client, name) {
-  const { code, verifier } = await authorizeAs(client, name);
+async function login(client, name, begin = beginLogin) {
+  const { code, verifier } = await authorizeAs(client, name, begin);
   const r = await exchange(client, code, verifier);
   assert.equal(r.status, 200, await r.clone().text());
   const tokens = await r.json();
@@ -261,10 +263,6 @@ const text = (r) => r.content.map((c) => c.text).join("\n");
 // ---------- tests ----------
 await start();
 const claude = await register();
-
-await check("homeassistant mode without a login method refuses to start", async () => {
-  await assert.rejects(createApp(config()), /Home Assistant login is not available/);
-});
 
 await check("GET /mcp without a token is 401 with a resource_metadata hint", async () => {
   const r = await get("/mcp");
@@ -317,7 +315,7 @@ await check("a refused person gets a 403 page and no code", async () => {
   assert.match(page, /bob is not allowed/);
   assert.match(page, /&lt;here&gt; &amp; &quot;nowhere&quot;/, "the refusal is escaped");
   assert.doesNotMatch(page, /<here>/);
-  assert.ok(logs.some((l) => l.includes("bob")), "refusal is logged by name");
+  assert.ok(logs.some((l) => l.includes('login refused for "bob"')), "refusal is logged by name");
 });
 
 await check("an unknown, reused or expired login state gets a plain 400 page", async () => {
@@ -566,6 +564,366 @@ await check("logins are logged by name, never with a token or code", async () =>
 });
 
 await stop();
+
+// ---------- Home Assistant: the real login method against a mock HA ----------
+// The mock speaks HA's OAuth endpoints and the WebSocket auth handshake plus auth/current_user.
+// Its /auth/authorize skips the login form: `&as=<user>` picks who logs in.
+const HA_CLIENT_ID = `${PUBLIC_URL}/`;
+const HA_REDIRECT_URI = `${PUBLIC_URL}/login/callback`;
+const haUsers = {
+  "admin-user": { id: "id-admin-user", name: "Admin Person", is_owner: false, is_admin: true },
+  "plain-user": { id: "id-plain-user", name: "Plain Person", is_owner: false, is_admin: false },
+};
+const ha = {
+  // when set, every HTTP request is answered with this status
+  failWith: undefined,
+  // when true, WebSocket upgrades are dropped
+  wsDown: false,
+  codes: new Map(),
+  // refresh token -> { user, valid }
+  sessions: new Map(),
+  // access token -> refresh token
+  access: new Map(),
+  issued: [],
+  revoked: [],
+  live(user) {
+    return [...this.sessions].filter(([, s]) => s.valid && s.user === user).map(([t]) => t);
+  },
+  // what deleting a session in the HA profile does: the refresh token stops working
+  invalidate(refreshToken) {
+    this.sessions.get(refreshToken).valid = false;
+  },
+};
+const haSecret = () => {
+  const s = randomBytes(24).toString("hex");
+  secrets.add(s);
+  return s;
+};
+
+const readForm = (req) =>
+  new Promise((resolve) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => resolve(Object.fromEntries(new URLSearchParams(raw))));
+  });
+
+const haServer = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://ha");
+  const json = (code, obj) => {
+    res.writeHead(code, { "content-type": "application/json" });
+    res.end(JSON.stringify(obj));
+  };
+  if (ha.failWith) return json(ha.failWith, { message: "Service unavailable" });
+
+  if (req.method === "GET" && url.pathname === "/auth/authorize") {
+    const p = url.searchParams;
+    if (
+      p.get("response_type") !== "code" ||
+      p.get("client_id") !== HA_CLIENT_ID ||
+      p.get("redirect_uri") !== HA_REDIRECT_URI ||
+      !p.get("state") ||
+      !haUsers[p.get("as")]
+    )
+      return json(400, { error: "invalid_request" });
+    const code = haSecret();
+    ha.codes.set(code, p.get("as"));
+    const back = new URL(p.get("redirect_uri"));
+    back.searchParams.set("code", code);
+    back.searchParams.set("state", p.get("state"));
+    res.writeHead(302, { location: back.href });
+    return res.end();
+  }
+
+  if (req.method === "POST" && url.pathname === "/auth/token") {
+    const body = await readForm(req);
+    if (body.client_id !== HA_CLIENT_ID) return json(400, { error: "invalid_request", error_description: "Invalid client id" });
+    if (body.grant_type === "authorization_code") {
+      const user = ha.codes.get(body.code);
+      ha.codes.delete(body.code);
+      if (!user) return json(400, { error: "invalid_request", error_description: "Invalid code" });
+      const refreshToken = haSecret();
+      const accessToken = haSecret();
+      ha.sessions.set(refreshToken, { user, valid: true });
+      ha.access.set(accessToken, refreshToken);
+      ha.issued.push(refreshToken);
+      return json(200, { access_token: accessToken, token_type: "Bearer", refresh_token: refreshToken, expires_in: 1800 });
+    }
+    if (body.grant_type === "refresh_token") {
+      if (!ha.sessions.get(body.refresh_token)?.valid) return json(400, { error: "invalid_grant" });
+      const accessToken = haSecret();
+      ha.access.set(accessToken, body.refresh_token);
+      return json(200, { access_token: accessToken, token_type: "Bearer", expires_in: 1800 });
+    }
+    return json(400, { error: "unsupported_grant_type" });
+  }
+
+  if (req.method === "POST" && url.pathname === "/auth/revoke") {
+    const body = await readForm(req);
+    const session = ha.sessions.get(body.token);
+    if (session?.valid) {
+      session.valid = false;
+      ha.revoked.push(body.token);
+    }
+    res.writeHead(200);
+    return res.end();
+  }
+
+  json(404, { message: "not found" });
+});
+
+const wss = new WebSocketServer({ noServer: true });
+haServer.on("upgrade", (req, socket, head) => {
+  if (ha.failWith || ha.wsDown || new URL(req.url, "http://ha").pathname !== "/api/websocket") {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    let user;
+    ws.send(JSON.stringify({ type: "auth_required", ha_version: "2026.3.1" }));
+    ws.on("message", (raw) => {
+      const msg = JSON.parse(String(raw));
+      if (!user) {
+        const refreshToken = msg.type === "auth" ? ha.access.get(msg.access_token) : undefined;
+        const session = refreshToken && ha.sessions.get(refreshToken);
+        if (!session?.valid) {
+          ws.send(JSON.stringify({ type: "auth_invalid", message: "Invalid access token or password" }));
+          ws.close();
+          return;
+        }
+        user = session.user;
+        ws.send(JSON.stringify({ type: "auth_ok", ha_version: "2026.3.1" }));
+        return;
+      }
+      if (msg.type === "auth/current_user")
+        ws.send(JSON.stringify({ id: msg.id, type: "result", success: true, result: { ...haUsers[user], credentials: [], mfa_modules: [] } }));
+    });
+  });
+});
+
+let haPort = 0;
+async function haListen() {
+  await new Promise((r) => haServer.listen(haPort, "127.0.0.1", r));
+  haPort = haServer.address().port;
+}
+async function haStop() {
+  for (const c of wss.clients) c.terminate();
+  await new Promise((r) => {
+    haServer.close(r);
+    haServer.closeAllConnections();
+  });
+}
+await haListen();
+const haBase = `http://127.0.0.1:${haPort}`;
+
+const haDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-ha-real-"));
+
+// homeassistant mode with nothing injected but the clock: the app builds the real HomeAssistantLogin
+async function startHa() {
+  const built = await createApp(
+    config({ HOME_ASSISTANT_PUBLIC_URL: haBase, HOME_ASSISTANT_URL: haBase, DATA_DIR: haDataDir }),
+    { now },
+  );
+  const server = await new Promise((resolve) => {
+    const s = built.app.listen(0, "127.0.0.1", () => resolve(s));
+  });
+  running = { ...built, server, base: `http://127.0.0.1:${server.address().port}` };
+  return running;
+}
+
+// /authorize, Approve, then HA's authorize page as `user`; returns our callback path and the PKCE verifier
+async function haBeginLogin(client, user) {
+  const { callback: toHa, verifier } = await beginLogin(client, user);
+  const u = new URL(toHa);
+  assert.equal(`${u.origin}${u.pathname}`, `${haBase}/auth/authorize`);
+  assert.deepEqual([...u.searchParams.keys()].sort(), ["client_id", "redirect_uri", "response_type", "state"]);
+  assert.equal(u.searchParams.get("response_type"), "code");
+  assert.equal(u.searchParams.get("client_id"), HA_CLIENT_ID);
+  assert.equal(u.searchParams.get("redirect_uri"), HA_REDIRECT_URI);
+  secrets.add(u.searchParams.get("state"));
+  u.searchParams.set("as", user);
+  const r = await fetch(u, { redirect: "manual" });
+  assert.equal(r.status, 302, await r.text());
+  const back = new URL(r.headers.get("location"));
+  assert.equal(`${back.origin}${back.pathname}`, HA_REDIRECT_URI);
+  return { callback: `${back.pathname}${back.search}`, verifier };
+}
+
+const haLogin = (client, user) => login(client, user, haBeginLogin);
+
+const noStack = (page) => assert.doesNotMatch(page, /at .*\.js/, "no stack trace");
+
+await startHa();
+const claudeHa = await register();
+
+await check("GET / names the app for Home Assistant", async () => {
+  const r = await get("/");
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type") ?? "", /text\/html/);
+  const page = await r.text();
+  assert.match(page, /<title>LubeLogger MCP<\/title>/);
+  assert.match(page, /<link rel="redirect_uri" href="https:\/\/mcp\.example\.com\/login\/callback">/);
+});
+
+await check("an HA admin connects end to end and lists tools", async () => {
+  const tokens = await haLogin(claudeHa, "admin-user");
+  const mcp = await mcpClient(tokens.access_token);
+  const { tools } = await mcp.listTools();
+  assert.equal(tools.length, 12);
+  await mcp.close();
+  assert.ok(logs.some((l) => l.includes('login by "Admin Person"')), "login is logged by name");
+  assert.equal(ha.live("admin-user").length, 1, "one HA session for the connection");
+});
+
+await check("a non-admin is refused and their HA session is revoked", async () => {
+  const { callback } = await haBeginLogin(claudeHa, "plain-user");
+  const r = await get(callback);
+  assert.equal(r.status, 403);
+  assert.equal(r.headers.get("location"), null);
+  const page = await r.text();
+  assert.match(page, /Only Home Assistant administrators can connect\./);
+  noStack(page);
+  assert.equal(ha.revoked.length, 1);
+  assert.deepEqual(ha.live("plain-user"), []);
+  assert.ok(
+    logs.some((l) => l.includes('login refused for "Plain Person": "Only Home Assistant administrators can connect."')),
+    "refusal is logged with the person's name",
+  );
+});
+
+await check("an admin login after a refused one from the same client works", async () => {
+  const client = await register();
+  const { callback } = await haBeginLogin(client, "plain-user");
+  assert.equal((await get(callback)).status, 403);
+  assert.deepEqual(ha.live("plain-user"), [], "the refusal leaves no HA session behind");
+  const tokens = await haLogin(client, "admin-user");
+  assert.equal(await mcpStatus(tokens.access_token), 200);
+  const r = await refresh(client, tokens.refresh_token);
+  assert.equal(r.status, 200);
+  remember(await r.json());
+});
+
+await check("deleting the HA session ends the connection at the next refresh", async () => {
+  const client = await register();
+  const tokens = await haLogin(client, "admin-user");
+  ha.invalidate(ha.issued.at(-1));
+  const r = await refresh(client, tokens.refresh_token);
+  assert.equal(r.status, 400);
+  assert.equal((await r.json()).error, "invalid_grant");
+  assert.equal(await mcpStatus(tokens.access_token), 401);
+  assert.equal((await refresh(client, tokens.refresh_token)).status, 400);
+});
+
+await check("removing admin rights ends the connection at the next refresh", async () => {
+  const client = await register();
+  const tokens = await haLogin(client, "admin-user");
+  const haToken = ha.issued.at(-1);
+  haUsers["admin-user"].is_admin = false;
+  try {
+    const r = await refresh(client, tokens.refresh_token);
+    assert.equal(r.status, 400);
+    assert.equal((await r.json()).error, "invalid_grant");
+  } finally {
+    haUsers["admin-user"].is_admin = true;
+  }
+  assert.equal(await mcpStatus(tokens.access_token), 401);
+  assert.ok(ha.revoked.includes(haToken), "the ended connection's HA session is revoked");
+});
+
+await check("HA returning 503 gives temporarily_unavailable and keeps the refresh token", async () => {
+  const client = await register();
+  const tokens = await haLogin(client, "admin-user");
+  ha.failWith = 503;
+  try {
+    const r = await refresh(client, tokens.refresh_token);
+    assert.equal(r.status, 503);
+    assert.equal((await r.json()).error, "temporarily_unavailable");
+  } finally {
+    ha.failWith = undefined;
+  }
+  const r = await refresh(client, tokens.refresh_token);
+  assert.equal(r.status, 200);
+  remember(await r.json());
+});
+
+await check("a WebSocket failure during refresh gives temporarily_unavailable", async () => {
+  const client = await register();
+  const tokens = await haLogin(client, "admin-user");
+  ha.wsDown = true;
+  try {
+    const r = await refresh(client, tokens.refresh_token);
+    assert.equal(r.status, 503);
+    assert.equal((await r.json()).error, "temporarily_unavailable");
+  } finally {
+    ha.wsDown = false;
+  }
+  const r = await refresh(client, tokens.refresh_token);
+  assert.equal(r.status, 200);
+  remember(await r.json());
+});
+
+await check("HA unreachable gives temporarily_unavailable", async () => {
+  const client = await register();
+  const tokens = await haLogin(client, "admin-user");
+  await haStop();
+  try {
+    const r = await refresh(client, tokens.refresh_token);
+    assert.equal(r.status, 503);
+    assert.equal((await r.json()).error, "temporarily_unavailable");
+  } finally {
+    await haListen();
+  }
+  const r = await refresh(client, tokens.refresh_token);
+  assert.equal(r.status, 200);
+  remember(await r.json());
+});
+
+await check("replacing a connection revokes the old HA session", async () => {
+  const client = await register();
+  const first = await haLogin(client, "admin-user");
+  const oldHaToken = ha.issued.at(-1);
+  const second = await haLogin(client, "admin-user");
+  assert.ok(ha.revoked.includes(oldHaToken), "the replaced connection's HA session is revoked");
+  assert.ok(ha.sessions.get(ha.issued.at(-1)).valid, "the new HA session is live");
+  assert.equal((await refresh(client, first.refresh_token)).status, 400);
+  assert.equal(await mcpStatus(second.access_token), 200);
+});
+
+await check("an expired or unknown login state shows the start-again page with 400", async () => {
+  const r = await get("/login/callback?state=nope&code=x");
+  assert.equal(r.status, 400);
+  const page = await r.text();
+  assert.match(page, /start again from Claude/);
+  noStack(page);
+});
+
+await check("HA unreachable during login shows a readable error page", async () => {
+  const { callback } = await haBeginLogin(claudeHa, "admin-user");
+  await haStop();
+  let r;
+  try {
+    r = await get(callback);
+  } finally {
+    await haListen();
+  }
+  assert.equal(r.status, 502);
+  assert.equal(r.headers.get("location"), null);
+  const page = await r.text();
+  assert.match(page, /The login could not be completed\. Start again from Claude\./);
+  noStack(page);
+});
+
+await check("HA logins and refusals are logged by name, never with a token or code", async () => {
+  const all = logs.join("\n");
+  assert.match(all, /Admin Person/);
+  assert.match(all, /Plain Person/);
+  assert.ok(ha.issued.length > 5);
+  for (const s of secrets) assert.ok(!all.includes(s), "a secret reached the log");
+});
+
+await stop();
+await haStop();
+await fs.rm(haDataDir, { recursive: true, force: true });
+
 mock.close();
 await fs.rm(dataDir, { recursive: true, force: true });
 console.error = realError;
