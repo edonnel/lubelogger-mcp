@@ -105,6 +105,28 @@ check("oidc is not available in this version", () => {
   assert.ok(r.problems.some((p) => /not available in this version/.test(p)));
 });
 
+// the add-on launcher: importing it does not run it
+const { buildEnv } = await import("../home-assistant/lubelogger_mcp/launch.mjs");
+const addonOptions = {
+  lubelogger_url: "http://local-lubelogger:8080",
+  lubelogger_api_key: "key",
+  public_url: "https://mcp.example.com",
+  home_assistant_public_url: "https://ha.example.com",
+};
+
+check("the add-on leaves ALLOWED_REDIRECT_HOSTS to the default unless an option is set", () => {
+  assert.equal(buildEnv(addonOptions).ALLOWED_REDIRECT_HOSTS, undefined);
+  assert.equal(buildEnv({ ...addonOptions, allowed_redirect_hosts: "" }).ALLOWED_REDIRECT_HOSTS, undefined);
+});
+
+check("the add-on passes allowed_redirect_hosts through as ALLOWED_REDIRECT_HOSTS", () => {
+  const env = buildEnv({ ...addonOptions, allowed_redirect_hosts: "claude.ai,claude.com,localhost,127.0.0.1" });
+  assert.equal(env.ALLOWED_REDIRECT_HOSTS, "claude.ai,claude.com,localhost,127.0.0.1");
+  const r = validateConfig(env);
+  assert.equal(r.ok, true, JSON.stringify(r.problems));
+  assert.deepEqual(r.config.ALLOWED_REDIRECT_HOSTS, ["claude.ai", "claude.com", "localhost", "127.0.0.1"]);
+});
+
 if (failed) {
   console.error(`${failed} check(s) failed`);
   process.exit(1);

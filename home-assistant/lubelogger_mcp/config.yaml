@@ -14,5 +14,6 @@ options:
 schema:
   lubelogger_url: url
   lubelogger_api_key: password
-  public_url: url?
-  home_assistant_public_url: url?
+  public_url: url
+  home_assistant_public_url: url
+  allowed_redirect_hosts: str?
