@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveVehicle, vehicleLabel, type Reminder, type ReminderMetric } from "./lubelogger.js";
-import { fmt, guard, isRealDate, normDate, notesField, num, tagsField, vehicleField, type Deps } from "./tools.js";
+import { fmt, guard, isRealDate, normDate, notesField, num, ownerOf, tagsField, vehicleField, type Deps } from "./tools.js";
 
 // ---------- input fields ----------
 
@@ -165,7 +165,7 @@ export function registerReminderTools(server: McpServer, deps: Deps): void {
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async (args) =>
+    async (args, extra) =>
       guard(async () => {
         checkMetric(args.metric, args.dueDate ?? null, args.dueOdometer ?? null);
         const v = resolveVehicle(await client.listVehicles(), args.vehicle);
@@ -191,7 +191,7 @@ export function registerReminderTools(server: McpServer, deps: Deps): void {
           notes: args.notes ?? "",
           tags: args.tags ?? "",
         };
-        const rec = pending.add({ kind: "reminder", vehicleId: v.id, vehicleLabel: vehicleLabel(v), body });
+        const rec = pending.add({ kind: "reminder", vehicleId: v.id, vehicleLabel: vehicleLabel(v), body, owner: ownerOf(extra) });
         return previewText(
           deps,
           rec.token,
@@ -228,7 +228,7 @@ export function registerReminderTools(server: McpServer, deps: Deps): void {
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async (args) =>
+    async (args, extra) =>
       guard(async () => {
         const v = resolveVehicle(await client.listVehicles(), args.vehicle);
         const reminders = await client.listReminders(v.id);
@@ -277,7 +277,7 @@ export function registerReminderTools(server: McpServer, deps: Deps): void {
         ];
         if (!rows.some((r) => r.endsWith("(CHANGED)"))) warnings.push("Nothing changes compared to the current reminder.");
 
-        const rec = pending.add({ kind: "reminderUpdate", vehicleId: v.id, vehicleLabel: vehicleLabel(v), body });
+        const rec = pending.add({ kind: "reminderUpdate", vehicleId: v.id, vehicleLabel: vehicleLabel(v), body, owner: ownerOf(extra) });
         return previewText(
           deps,
           rec.token,

@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveVehicle, vehicleLabel, type RecordKind } from "./lubelogger.js";
-import { KIND_LABEL, NOTES_FORMAT, fmt, guard, isRealDate, normDate, notesField, num, tagsField, vehicleField, type Deps } from "./tools.js";
+import { KIND_LABEL, NOTES_FORMAT, fmt, guard, isRealDate, normDate, notesField, num, ownerOf, tagsField, vehicleField, type Deps } from "./tools.js";
 
 // ---------- input fields ----------
 
@@ -194,7 +194,7 @@ export function registerRecordTools(server: McpServer, deps: Deps): void {
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async (args) =>
+    async (args, extra) =>
       guard(async () => {
         const kind = args.recordType;
         const editable = EDITABLE[kind];
@@ -224,7 +224,7 @@ export function registerRecordTools(server: McpServer, deps: Deps): void {
         });
         const warnings = rows.some((r) => r.endsWith("(CHANGED)")) ? [] : ["Nothing changes compared to the current record."];
 
-        const rec = pending.add({ kind, update: true, vehicleId: v.id, vehicleLabel: vehicleLabel(v), body });
+        const rec = pending.add({ kind, update: true, vehicleId: v.id, vehicleLabel: vehicleLabel(v), body, owner: ownerOf(extra) });
         const lines = [
           `PREVIEW: nothing has been saved yet.`,
           ``,

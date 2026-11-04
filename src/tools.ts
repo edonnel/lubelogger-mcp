@@ -20,6 +20,12 @@ type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean
 const ok = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
 const fail = (text: string): ToolResult => ({ isError: true, content: [{ type: "text", text }] });
 
+/** Who is calling: the signed-in person in OAuth modes, the single "token" identity otherwise. */
+export function ownerOf(extra: { authInfo?: { extra?: Record<string, unknown> } }): string {
+  const id = extra.authInfo?.extra?.personId;
+  return typeof id === "string" ? id : "token";
+}
+
 export async function guard(fn: () => Promise<string>): Promise<ToolResult> {
   try {
     return ok(await fn());
@@ -132,6 +138,8 @@ function findDuplicates(records: Record<string, unknown>[], date: string, odomet
 
 interface PreviewArgs {
   deps: Deps;
+  /** Who proposes it; only they can commit it. */
+  owner: string;
   vehicleQuery: string | number;
   kind: RecordKind;
   date: string;
@@ -196,6 +204,7 @@ async function buildPreview(a: PreviewArgs): Promise<string> {
     vehicleId: vehicle.id,
     vehicleLabel: vehicleLabel(vehicle),
     body: a.buildBody(latest, odometer),
+    owner: a.owner,
   });
 
   const lines = [
@@ -284,10 +293,11 @@ export function registerTools(server: McpServer, deps: Deps): void {
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async (args) =>
+    async (args, extra) =>
       guard(() =>
         buildPreview({
           deps,
+          owner: ownerOf(extra),
           vehicleQuery: args.vehicle,
           kind: args.recordType,
           date: args.date,
@@ -340,7 +350,7 @@ export function registerTools(server: McpServer, deps: Deps): void {
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async (args) => {
+    async (args, extra) => {
       const unitPrice = args.cost / args.fuelConsumed;
       const extraWarnings: string[] = [];
       if (unitPrice > 20) extraWarnings.push(`Price per unit works out to ${unitPrice.toFixed(2)}. Check that fuel amount and cost weren't swapped.`);
@@ -348,6 +358,7 @@ export function registerTools(server: McpServer, deps: Deps): void {
       return guard(() =>
         buildPreview({
           deps,
+          owner: ownerOf(extra),
           vehicleQuery: args.vehicle,
           kind: "fuel",
           date: args.date,
@@ -399,10 +410,11 @@ export function registerTools(server: McpServer, deps: Deps): void {
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async (args) =>
+    async (args, extra) =>
       guard(() =>
         buildPreview({
           deps,
+          owner: ownerOf(extra),
           vehicleQuery: args.vehicle,
           kind: "odometer",
           date: args.date,
@@ -435,9 +447,9 @@ export function registerTools(server: McpServer, deps: Deps): void {
       inputSchema: { confirmationToken: z.string().min(1).describe("Token returned by a propose_* tool.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ confirmationToken }) =>
+    async ({ confirmationToken }, extra) =>
       guard(async () => {
-        const rec = pending.take(confirmationToken);
+        const rec = pending.take(confirmationToken, ownerOf(extra));
         if (!rec) {
           throw new Error("Unknown or expired confirmation token. Run the propose_* tool again and re-confirm with the user.");
         }

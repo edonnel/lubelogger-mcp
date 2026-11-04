@@ -13,6 +13,8 @@ export interface PendingRecord {
   body: Record<string, unknown>;
   /** True when body replaces an existing record of this kind instead of adding one. */
   update?: boolean;
+  /** Who proposed it; only they can commit it. "token" in token mode, the person's id in OAuth modes. */
+  owner: string;
   createdAt: number;
 }
 
@@ -39,11 +41,15 @@ export class PendingStore {
     return full;
   }
 
-  /** Removes and returns the record (single use). Undefined if unknown or expired. */
-  take(token: string): PendingRecord | undefined {
+  /**
+   * Removes and returns the record (single use). Undefined if unknown, expired, or proposed by someone else;
+   * someone else's record stays in place for its owner.
+   */
+  take(token: string, owner: string): PendingRecord | undefined {
     this.sweep();
     const rec = this.items.get(token.trim().toLowerCase());
-    if (rec) this.items.delete(rec.token);
+    if (!rec || rec.owner !== owner) return undefined;
+    this.items.delete(rec.token);
     return rec;
   }
 
