@@ -46,6 +46,12 @@ const authSchema = z.object({
   HOME_ASSISTANT_URL: originUrl("http://homeassistant:8123").optional(),
   /** Where OAuth state is kept. */
   DATA_DIR: z.string().default("./data"),
+  /** Hostnames an OAuth client may register as its redirect target, comma-separated. */
+  ALLOWED_REDIRECT_HOSTS: z
+    .string()
+    .default("claude.ai,claude.com")
+    .transform((v) => v.split(",").map((h) => h.trim().toLowerCase()).filter((h) => h !== ""))
+    .refine((hosts) => hosts.length > 0, "must list at least one hostname"),
 });
 
 const fullSchema = schema.extend(authSchema.shape);

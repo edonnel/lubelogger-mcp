@@ -72,7 +72,7 @@ export async function createApp(
     if (!method) throw new Error("Home Assistant login is not available in this build (AUTH_MODE=homeassistant)");
 
     const store = await AuthStore.open(config.DATA_DIR, deps.now);
-    const provider = new LoginProvider(store, method, deps.now);
+    const provider = new LoginProvider(store, method, deps.now, { allowedRedirectHosts: config.ALLOWED_REDIRECT_HOSTS });
     endpoint = OAUTH_ENDPOINT;
     guard = mountOAuth(app, { publicUrl: config.PUBLIC_URL, provider });
     close = () => provider.close();

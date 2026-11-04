@@ -81,7 +81,10 @@ const stub = {
     this.sessions++;
     return { person: { id: `id-${name}`, name }, upstream: { session: `up-${name}-${this.sessions}`, name } };
   },
+  // when set, recheck waits on it: holds a refresh open
+  gate: undefined,
   async recheck(upstream) {
+    if (this.gate) await this.gate;
     if (this.recheckMode === "unavailable") return { ok: false, reason: "unavailable" };
     if (this.recheckMode === "refused") return { ok: false, reason: "refused" };
     if (this.recheckMode === "throws") throw new Error("connect ECONNREFUSED");
@@ -106,6 +109,7 @@ function config(over = {}) {
     HOME_ASSISTANT_PUBLIC_URL: "https://ha.example.com",
     HOME_ASSISTANT_URL: "http://ha.example.com:8123",
     DATA_DIR: dataDir,
+    ALLOWED_REDIRECT_HOSTS: "claude.example.com",
     ...over,
   });
   assert.ok(r.ok, JSON.stringify(r.problems));
@@ -133,22 +137,34 @@ const get = (p, init = {}) => fetch(running.base + p, { redirect: "manual", ...i
 const form = (p, fields) =>
   fetch(running.base + p, {
     method: "POST",
+    redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(fields).toString(),
   });
 
-async function register() {
-  const r = await fetch(running.base + "/register", {
+const registerRaw = (metadata) =>
+  fetch(running.base + "/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ redirect_uris: [REDIRECT_URI], token_endpoint_auth_method: "none", client_name: "test client" }),
+    body: JSON.stringify({ redirect_uris: [REDIRECT_URI], token_endpoint_auth_method: "none", client_name: "test client", ...metadata }),
   });
+
+async function register(metadata = {}) {
+  const r = await registerRaw(metadata);
   assert.equal(r.status, 201);
   return r.json();
 }
 
-// /authorize up to the login method's redirect; returns the callback path and the PKCE verifier
-async function beginLogin(client, name) {
+const loginStateOf = (html) => {
+  const m = html.match(/name="loginState" value="([^"]+)"/);
+  assert.ok(m, "the approval page carries the login state");
+  return m[1];
+};
+
+const approve = (loginState) => form("/login", { loginState });
+
+// /authorize, shows the approval page; returns it with the login state and the PKCE verifier
+async function openApproval(client, name) {
   stub.next = name;
   const verifier = b64url(randomBytes(32));
   const challenge = b64url(createHash("sha256").update(verifier).digest());
@@ -161,6 +177,15 @@ async function beginLogin(client, name) {
     state: "claude-state-123",
   });
   const r = await get(`/authorize?${q}`);
+  const html = await r.text();
+  assert.equal(r.status, 200, html);
+  return { response: r, html, loginState: loginStateOf(html), verifier };
+}
+
+// /authorize and the approval, up to the login method's redirect; returns the callback path and the PKCE verifier
+async function beginLogin(client, name) {
+  const { loginState, verifier } = await openApproval(client, name);
+  const r = await approve(loginState);
   assert.equal(r.status, 302, await r.text());
   return { callback: r.headers.get("location"), verifier };
 }
@@ -320,6 +345,48 @@ await check("an unknown, reused or expired login state gets a plain 400 page", a
   assert.match(await expired.text(), /This login link has expired, start again from Claude/);
 });
 
+await check("registration refuses redirect hosts that are not allowed", async () => {
+  for (const uri of ["https://attacker.example.net/cb", "http://claude.example.com/cb", "https://claude.example.com.attacker.example.net/cb"]) {
+    const r = await registerRaw({ redirect_uris: [REDIRECT_URI, uri] });
+    assert.equal(r.status, 400, uri);
+    assert.equal((await r.json()).error, "invalid_client_metadata");
+  }
+});
+
+await check("/authorize shows an approval page naming the app and where it returns", async () => {
+  const named = await register({ client_name: "<b>Sneaky</b> & co" });
+  const { response, html } = await openApproval(named, "alice");
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.match(response.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.match(html, /&lt;b&gt;Sneaky&lt;\/b&gt; &amp; co/);
+  assert.doesNotMatch(html, /<b>Sneaky/);
+  assert.match(html, /claude\.example\.com/);
+  assert.match(html, /<form method="post" action="\/login">/);
+
+  const unnamed = await register({ client_name: undefined });
+  assert.match((await openApproval(unnamed, "alice")).html, /An unnamed app/);
+});
+
+await check("a login that was not approved is refused at the callback", async () => {
+  const { loginState } = await openApproval(claude, "alice");
+  const r = await get(`/login/callback?state=${encodeURIComponent(loginState)}&as=alice`);
+  assert.equal(r.status, 400);
+  assert.match(await r.text(), /This login link has expired, start again from Claude/);
+  // and the state is spent: approving it afterwards does not revive it
+  assert.equal((await approve(loginState)).status, 400);
+});
+
+await check("an unknown or expired approval gets the start-again page", async () => {
+  const unknown = await approve("nope");
+  assert.equal(unknown.status, 400);
+  assert.match(await unknown.text(), /This login link has expired, start again from Claude/);
+  const { loginState } = await openApproval(claude, "alice");
+  clock += 11 * MINUTE;
+  const late = await approve(loginState);
+  assert.equal(late.status, 400);
+  assert.match(await late.text(), /This login link has expired, start again from Claude/);
+});
+
 await check("refresh rotates the token; the old one works only within 60 seconds and gives the same pair", async () => {
   const r1 = await refresh(claude, alice.refresh_token);
   assert.equal(r1.status, 200);
@@ -348,6 +415,27 @@ await check("two refreshes at once with the same token get the same pair", async
   const again = await refresh(claude, alice.refresh_token);
   assert.equal(again.status, 200);
   alice = remember(await again.json());
+});
+
+await check("another client cannot join a refresh in progress", async () => {
+  const thief = await register();
+  let release;
+  stub.gate = new Promise((r) => (release = r));
+  const mine = refresh(claude, alice.refresh_token);
+  await new Promise((r) => setTimeout(r, 50));
+  // fired while the first refresh is held open; the gate is released without waiting on it, so a join cannot deadlock
+  const theirsPending = refresh(thief, alice.refresh_token);
+  await new Promise((r) => setTimeout(r, 50));
+  release();
+  stub.gate = undefined;
+  const theirs = await theirsPending;
+  assert.equal(theirs.status, 400);
+  const body = await theirs.json();
+  assert.equal(body.error, "invalid_grant");
+  assert.equal(body.access_token, undefined);
+  const r = await mine;
+  assert.equal(r.status, 200);
+  alice = remember(await r.json());
 });
 
 await check("a stale refresh after 60 seconds is rejected", async () => {

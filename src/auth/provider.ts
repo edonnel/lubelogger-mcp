@@ -5,6 +5,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type express from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
+  InvalidClientMetadataError,
   InvalidGrantError,
   InvalidTokenError,
   TemporarilyUnavailableError,
@@ -25,7 +26,12 @@ export const CODE_TTL_MS = 10 * 60_000;
 
 const EXPIRED_LINK = "This login link has expired, start again from Claude.";
 
-type LoginState = { clientId: string; params: AuthorizationParams; createdAt: number };
+export const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com"];
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
+
+// approved: the person pressed Approve on our page; only then is the login method's answer accepted
+type LoginState = { clientId: string; params: AuthorizationParams; createdAt: number; approved: boolean };
 
 type PendingCode = {
   clientId: string;
@@ -52,17 +58,42 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch] ?? ch);
 }
 
-function page(res: express.Response, status: number, title: string, message: string): void {
+/** Sends a small page. `body` is trusted HTML: escape anything interpolated into it. */
+function sendPage(res: express.Response, status: number, title: string, body: string): void {
   res
     .status(status)
-    .set("Cache-Control", "no-store")
+    .set({
+      "Cache-Control": "no-store",
+      // never inside a frame, so the Approve button cannot be clickjacked
+      "X-Frame-Options": "DENY",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+    })
     .type("html")
     .send(
       "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">" +
         `<title>${escapeHtml(title)}</title></head>` +
         `<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">` +
-        `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></body></html>`,
+        `<h1>${escapeHtml(title)}</h1>${body}</body></html>`,
     );
+}
+
+function page(res: express.Response, status: number, title: string, message: string): void {
+  sendPage(res, status, title, `<p>${escapeHtml(message)}</p>`);
+}
+
+/** The hostname of an allowed redirect URI, or undefined: https to a listed host, or http to a listed loopback host. */
+function allowedRedirectHost(uri: string, allowed: readonly string[]): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return undefined;
+  }
+  const host = url.hostname.toLowerCase();
+  if (!allowed.includes(host)) return undefined;
+  if (url.protocol === "https:") return host;
+  if (url.protocol === "http:" && LOOPBACK_HOSTS.has(host)) return host;
+  return undefined;
 }
 
 export class LoginProvider implements OAuthServerProvider {
@@ -76,14 +107,22 @@ export class LoginProvider implements OAuthServerProvider {
 
   readonly clientsStore: OAuthRegisteredClientsStore;
 
+  private readonly allowedRedirectHosts: readonly string[];
+
   constructor(
     private readonly store: AuthStore,
     private readonly method: LoginMethod,
     private readonly now: () => number = Date.now,
+    opts: { allowedRedirectHosts?: readonly string[] } = {},
   ) {
+    this.allowedRedirectHosts = opts.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS;
     this.clientsStore = {
       getClient: (id) => store.getClient(id),
       registerClient: async (client) => {
+        // only Claude's own return addresses: otherwise anyone could register a client that sends codes to their server
+        for (const uri of client.redirect_uris)
+          if (!allowedRedirectHost(uri, this.allowedRedirectHosts))
+            throw new InvalidClientMetadataError("redirect_uris may only point to an allowed host over https");
         // the SDK's registration handler always generates client_id before calling this
         const full = client as OAuthClientInformationFull;
         await store.saveClient(full);
@@ -95,9 +134,49 @@ export class LoginProvider implements OAuthServerProvider {
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: express.Response): Promise<void> {
     this.sweep();
+    // checked again in case a client was registered before the allowlist changed; never send the browser to it
+    const host = allowedRedirectHost(params.redirectUri, this.allowedRedirectHosts);
+    if (!host) {
+      page(res, 400, "Not allowed", "This app's return address is not allowed on this server.");
+      return;
+    }
+
     const loginState = newSecret();
-    this.states.set(loginState, { clientId: client.client_id, params, createdAt: this.now() });
-    await this.method.start(loginState, res);
+    this.states.set(loginState, { clientId: client.client_id, params, createdAt: this.now(), approved: false });
+
+    const name = client.client_name?.trim() ? client.client_name.trim() : "An unnamed app";
+    sendPage(
+      res,
+      200,
+      "Connect to LubeLogger MCP?",
+      `<p><strong>${escapeHtml(name)}</strong> wants to connect to LubeLogger MCP and will return to ` +
+        `<strong>${escapeHtml(host)}</strong>.</p>` +
+        "<p>Only continue if you started this from Claude.</p>" +
+        "<form method=\"post\" action=\"/login\">" +
+        `<input type="hidden" name="loginState" value="${escapeHtml(loginState)}">` +
+        "<button type=\"submit\">Approve</button></form>",
+    );
+  }
+
+  /** POST /login: the person pressed Approve on the page `authorize` showed. Never throws. */
+  async handleApprove(req: express.Request, res: express.Response): Promise<void> {
+    try {
+      this.sweep();
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const loginState = typeof body.loginState === "string" ? body.loginState : "";
+      const entry = this.states.get(loginState);
+      // approval is single use too: a second press, or an expired state, has to start again
+      if (!entry || entry.approved || this.now() - entry.createdAt > LOGIN_STATE_TTL_MS) {
+        if (entry) this.states.delete(loginState);
+        page(res, 400, "Login expired", EXPIRED_LINK);
+        return;
+      }
+      entry.approved = true;
+      await this.method.start(loginState, res);
+    } catch (err) {
+      log(`login could not be started: ${err instanceof Error ? err.message : "unknown error"}`);
+      if (!res.headersSent) page(res, 502, "Login failed", "The login could not be started. Start again from Claude.");
+    }
   }
 
   /** GET /login/callback: the browser comes back from the login method. Never throws. */
@@ -108,7 +187,7 @@ export class LoginProvider implements OAuthServerProvider {
       const entry = this.states.get(loginState);
       // single use: gone before the login method is even asked
       if (entry) this.states.delete(loginState);
-      if (!entry || this.now() - entry.createdAt > LOGIN_STATE_TTL_MS) {
+      if (!entry || !entry.approved || this.now() - entry.createdAt > LOGIN_STATE_TTL_MS) {
         page(res, 400, "Login expired", EXPIRED_LINK);
         return;
       }
@@ -189,7 +268,8 @@ export class LoginProvider implements OAuthServerProvider {
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string): Promise<OAuthTokens> {
-    const key = hashToken(refreshToken);
+    // bound to the client: another client presenting the same token must not join this refresh
+    const key = `${client.client_id}:${hashToken(refreshToken)}`;
     const inFlight = this.refreshing.get(key);
     if (inFlight) return inFlight;
 

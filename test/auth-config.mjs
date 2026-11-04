@@ -87,6 +87,18 @@ check("a path in HOME_ASSISTANT_PUBLIC_URL is refused", () => {
   assert.ok(r.problems.some((p) => /HOME_ASSISTANT_PUBLIC_URL/.test(p)));
 });
 
+check("ALLOWED_REDIRECT_HOSTS defaults to claude.ai and claude.com", () => {
+  const r = validateConfig(haEnv);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.config.ALLOWED_REDIRECT_HOSTS, ["claude.ai", "claude.com"]);
+});
+
+check("ALLOWED_REDIRECT_HOSTS is split, trimmed and lower-cased", () => {
+  const r = validateConfig({ ...haEnv, ALLOWED_REDIRECT_HOSTS: " Claude.AI, localhost ,,app.example.com " });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.config.ALLOWED_REDIRECT_HOSTS, ["claude.ai", "localhost", "app.example.com"]);
+});
+
 check("oidc is not available in this version", () => {
   const r = validateConfig({ ...base, AUTH_MODE: "oidc" });
   assert.equal(r.ok, false);

@@ -1,5 +1,5 @@
 // Mounts the OAuth endpoints and returns the bearer check for /mcp.
-import type express from "express";
+import express from "express";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { LoginProvider } from "./provider.js";
@@ -44,6 +44,7 @@ export function mountOAuth(
       clientRegistrationOptions: { clientSecretExpirySeconds: 0 },
     }),
   );
+  app.post("/login", express.urlencoded({ extended: false, limit: "4kb" }), (req, res) => provider.handleApprove(req, res));
   app.get("/login/callback", (req, res) => provider.handleCallback(req, res));
 
   return requireBearerAuth({
