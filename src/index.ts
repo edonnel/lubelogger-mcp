@@ -23,7 +23,7 @@ const INSTRUCTIONS = [
   "If a vehicle is ambiguous, call list_vehicles and ask.",
   "Reminders (e.g. tire rotation) use the same propose/commit flow: check list_reminders first and prefer propose_reminder_update over a duplicate.",
   "Notes are Markdown laid out like the original document (facts as a list, line items as a table, totals as a list); the notes field spells out the format.",
-  "To correct an existing record, find it with list_records, then call propose_record_update with only the fields that change",
+  "To correct an existing record, find it with list_records (read it in full with get_record before rewriting notes), then call propose_record_update with only the fields that change",
   "(attachments and everything else are kept) and commit_record after the user confirms.",
 ].join(" ");
 

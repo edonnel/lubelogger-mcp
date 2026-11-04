@@ -79,6 +79,23 @@ function recordLine(kind: RecordKind, r: Record<string, unknown>): string {
   return parts.join(", ");
 }
 
+/** The record with this id, or an error naming the vehicle's most recent ones. */
+function findRecord(kind: RecordKind, vehicle: string, records: Record<string, unknown>[], recordId: string | number): Record<string, unknown> {
+  const found = records.find((r) => String(r.id) === String(recordId));
+  if (found) return found;
+  const recent = [...records]
+    .sort((a, b) => (recordDate(b.date) ?? "").localeCompare(recordDate(a.date) ?? ""))
+    .slice(0, 10)
+    .map((r) => recordLine(kind, r))
+    .join("\n");
+  throw new Error(
+    `${vehicle} has no ${KIND_LABEL[kind].toLowerCase()} with id ${String(recordId)}.` +
+      (recent ? ` Its most recent ones:\n${recent}` : " It has none of that type."),
+  );
+}
+
+const recordIdField = z.union([z.number().int(), z.string().regex(/^\d+$/)]).describe("Record id from list_records.");
+
 // ---------- tool registration ----------
 
 export function registerRecordTools(server: McpServer, deps: Deps): void {
@@ -90,7 +107,7 @@ export function registerRecordTools(server: McpServer, deps: Deps): void {
       title: "List records",
       description:
         "List a vehicle's existing records of one type, newest first, with id, date, odometer, description or fuel amount, cost and attachment count. " +
-        "Use it to find the record a user wants to correct before calling propose_record_update.",
+        "Notes are cut short here: use get_record to read one record in full. Use it to find the record a user wants to correct before calling propose_record_update.",
       inputSchema: {
         vehicle: vehicleField,
         recordType: recordTypeField,
@@ -118,18 +135,53 @@ export function registerRecordTools(server: McpServer, deps: Deps): void {
   );
 
   server.registerTool(
+    "get_record",
+    {
+      title: "Get record",
+      description:
+        "Read one existing record in full: every field, the complete notes, attachment names and extra fields. Call it before rewriting " +
+        "or reformatting a record's notes, since propose_record_update replaces the whole note.",
+      inputSchema: { vehicle: vehicleField, recordType: recordTypeField, recordId: recordIdField },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) =>
+      guard(async () => {
+        const kind = args.recordType;
+        const v = resolveVehicle(await client.listVehicles(), args.vehicle);
+        const r = findRecord(kind, vehicleLabel(v), await client.listRecords(kind, v.id), args.recordId);
+        const fields = Object.entries(EDITABLE[kind])
+          .filter(([field]) => field !== "notes")
+          .map(([field, fieldKind]) => `- ${LABELS[field]}: ${show(fieldKind, r[field]) || "(none)"}`);
+        const files = Array.isArray(r.files) ? r.files.map((f) => `  - ${String((f as Record<string, unknown>).name ?? "(unnamed)")}`) : [];
+        const extras = Array.isArray(r.extraFields)
+          ? r.extraFields.map((f) => `  - ${String((f as Record<string, unknown>).name)}: ${String((f as Record<string, unknown>).value ?? "")}`)
+          : [];
+        return [
+          `${KIND_LABEL[kind]} id ${String(r.id)} for ${vehicleLabel(v)} [id ${v.id}]`,
+          ...fields,
+          `- Attachments: ${files.length ? "\n" + files.join("\n") : "none"}`,
+          `- Extra fields: ${extras.length ? "\n" + extras.join("\n") : "none"}`,
+          ``,
+          `Notes (complete):`,
+          String(r.notes ?? "") || "(none)",
+        ].join("\n");
+      }),
+  );
+
+  server.registerTool(
     "propose_record_update",
     {
       title: "Propose record update",
       description:
-        "Prepare a correction to an EXISTING record. Get the id from list_records. Pass only the fields that change; everything else, " +
+        "Prepare a correction to an EXISTING record. Get the id from list_records, and read the record with get_record first when changing " +
+        "notes, because the notes you pass replace the whole note. Pass only the fields that change; everything else, " +
         "including attachments and extra fields, is kept exactly as it is. Nothing is saved: returns a before/after preview and a confirmation " +
         "token for commit_record. Service, repair and upgrade records can change date, odometer, description, cost, notes, tags; fuel records " +
         "date, odometer, fuelConsumed, cost, isFillToFull, missedFuelUp, notes, tags; odometer records date, odometer, notes, tags.",
       inputSchema: {
         vehicle: vehicleField,
         recordType: recordTypeField,
-        recordId: z.union([z.number().int(), z.string().regex(/^\d+$/)]).describe("Record id from list_records."),
+        recordId: recordIdField,
         date: isoDateField.optional(),
         odometer: z.number().int().min(0).max(2_000_000).optional().describe("New odometer reading. 0 means no reading (LubeLogger shows it blank)."),
         description: z.string().min(1).max(200).optional(),
@@ -158,18 +210,7 @@ export function registerRecordTools(server: McpServer, deps: Deps): void {
 
         const v = resolveVehicle(await client.listVehicles(), args.vehicle);
         const records = await client.listRecords(kind, v.id);
-        const cur = records.find((r) => String(r.id) === String(args.recordId));
-        if (!cur) {
-          const recent = records
-            .sort((a, b) => (recordDate(b.date) ?? "").localeCompare(recordDate(a.date) ?? ""))
-            .slice(0, 10)
-            .map((r) => recordLine(kind, r))
-            .join("\n");
-          throw new Error(
-            `${vehicleLabel(v)} has no ${KIND_LABEL[kind].toLowerCase()} with id ${String(args.recordId)}.` +
-              (recent ? ` Its most recent ones:\n${recent}` : " It has none of that type."),
-          );
-        }
+        const cur = findRecord(kind, vehicleLabel(v), records, args.recordId);
 
         // LubeLogger's update overwrites every field, attachments and extra fields included, so start from the whole record as returned
         const body: Record<string, unknown> = { ...cur, ...changes, id: Number(cur.id) };

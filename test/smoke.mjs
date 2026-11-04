@@ -42,6 +42,17 @@ const existing = {
         files: [{ name: "invoice.pdf", location: "/documents/abc123.pdf" }],
         extraFields: [{ name: "Shop", value: "Jiffy" }],
       },
+      {
+        id: 8,
+        date: "2026-06-01",
+        odometer: 80100,
+        description: "Brake pads",
+        cost: 310,
+        notes: "- **Shop:** Midas, Springfield\n- **Invoice:** 55120\n\n| Item | Amount |\n|---|--:|\n| Front pads | $120.00 |\n| Labor | $190.00 |\n\n- **Total:** $310.00 (the full note must come back, not the first 80 characters)",
+        tags: "brakes",
+        files: [{ name: "receipt.jpg", location: "/documents/def456.jpg" }],
+        extraFields: [{ name: "Warranty", value: "12 months" }],
+      },
     ],
   },
   gasrecords: {
@@ -208,6 +219,7 @@ async function main() {
     assert.deepEqual(tools, [
       "commit_record",
       "get_latest_odometer",
+      "get_record",
       "list_records",
       "list_reminders",
       "list_vehicles",
@@ -218,7 +230,7 @@ async function main() {
       "propose_reminder_update",
       "propose_service_record",
     ]);
-    pass("lists all 11 tools");
+    pass("lists all 12 tools");
 
     const lv = text(await client.callTool({ name: "list_vehicles", arguments: {} }));
     assert.match(lv, /Tacoma/);
@@ -478,6 +490,17 @@ async function main() {
     assert.match(r.text, /id 7.*2026-10-14.*Oil change/);
     assert.match(r.text, /1 attachment/);
     pass("list_records finds a vehicle's records with ids and attachment counts");
+
+    // reformatting a note means rewriting all of it, so Claude must be able to read all of it first
+    r = await callOrReject(client, "get_record", { vehicle: "tacoma", recordType: "service", recordId: 8 });
+    assert.ok(!r.rejected, r.text);
+    assert.match(r.text, /the full note must come back, not the first 80 characters/);
+    assert.match(r.text, /\| Front pads \| \$120\.00 \|/);
+    assert.match(r.text, /receipt\.jpg/);
+    assert.match(r.text, /Warranty: 12 months/);
+    r = await callOrReject(client, "get_record", { vehicle: "tacoma", recordType: "service", recordId: 99 });
+    assert.ok(r.rejected);
+    pass("get_record returns one record in full: notes, attachments and extra fields");
 
     const writesBeforeEdit = posts.length;
     r = await callOrReject(client, "propose_record_update", { vehicle: "tacoma", recordType: "service", recordId: 7, cost: 95 });

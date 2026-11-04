@@ -71,6 +71,7 @@ photo/PDF  ->  Claude reads it  ->  propose_* tool  ->  PREVIEW + warnings + tok
 | `propose_reminder` | New reminder due at a date, an odometer reading, or both (whichever comes first) |
 | `propose_reminder_update` | Change an existing reminder by id, e.g. move "Rotate Tires" forward after a rotation. Unspecified fields are kept |
 | `list_records` | A vehicle's records of one type, newest first, with id, date, odometer, cost and attachment count |
+| `get_record` | One record in full: every field, the complete notes, attachment names and extra fields |
 | `propose_record_update` | Correct an existing service, repair, upgrade, fuel or odometer record by id. Only the given fields change; attachments and everything else are kept |
 | `commit_record` | Save a previously proposed record or reminder by token |
 
