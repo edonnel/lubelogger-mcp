@@ -2,7 +2,7 @@
 import express from "express";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
-import type { LoginProvider } from "./provider.js";
+import { page, type LoginProvider } from "./provider.js";
 
 /** Seconds Claude is told to wait before retrying a refresh while the login method is unreachable. */
 const RETRY_AFTER_SECONDS = 30;
@@ -22,6 +22,21 @@ const temporarilyUnavailableAs503: express.RequestHandler = (_req, res, next) =>
     return json(body);
   };
   next();
+};
+
+/**
+ * The last handler in OAuth mode. Express's default error page shows a stack trace outside production, and a
+ * browser can reach it with a malformed or oversize POST /login body. This one names no error and echoes nothing.
+ */
+export const plainErrorPage: express.ErrorRequestHandler = (err: unknown, _req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = (err as { status?: unknown } | undefined)?.status;
+  if (typeof status === "number" && status >= 400 && status < 500) {
+    page(res, 400, "Bad request", "The request could not be read. Start again from Claude.");
+    return;
+  }
+  console.error(`[http] request failed: ${err instanceof Error ? err.name : "unknown error"}`);
+  page(res, 500, "Something went wrong", "Something went wrong. Start again from Claude.");
 };
 
 export function mountOAuth(

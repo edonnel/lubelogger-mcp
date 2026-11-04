@@ -136,11 +136,11 @@ async function stop() {
 // ---------- OAuth helpers ----------
 const b64url = (buf) => buf.toString("base64url");
 const get = (p, init = {}) => fetch(running.base + p, { redirect: "manual", ...init });
-const form = (p, fields) =>
+const form = (p, fields, headers = {}) =>
   fetch(running.base + p, {
     method: "POST",
     redirect: "manual",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
     body: new URLSearchParams(fields).toString(),
   });
 
@@ -163,7 +163,22 @@ const loginStateOf = (html) => {
   return m[1];
 };
 
-const approve = (loginState) => form("/login", { loginState });
+// the approval page's browser cookie, as "lm_login=<nonce>" ready for a Cookie header
+const cookieOf = (response) => {
+  const set = response.headers.getSetCookie().find((c) => c.startsWith("lm_login="));
+  assert.ok(set, "the approval page sets the login cookie");
+  assert.match(set, /HttpOnly/);
+  assert.match(set, /Secure/);
+  assert.match(set, /SameSite=Lax/);
+  assert.match(set, /Path=\/login(;|$)/);
+  return set.split(";")[0];
+};
+
+const approve = (loginState, cookie, headers = {}) =>
+  form("/login", { loginState }, { ...(cookie ? { cookie } : {}), ...headers });
+
+// the login method's return to /login/callback, from the browser that holds the cookie
+const callBack = (begun) => get(begun.callback, { headers: { cookie: begun.cookie } });
 
 // /authorize, shows the approval page; returns it with the login state and the PKCE verifier
 async function openApproval(client, name) {
@@ -181,21 +196,22 @@ async function openApproval(client, name) {
   const r = await get(`/authorize?${q}`);
   const html = await r.text();
   assert.equal(r.status, 200, html);
-  return { response: r, html, loginState: loginStateOf(html), verifier };
+  return { response: r, html, loginState: loginStateOf(html), verifier, cookie: cookieOf(r) };
 }
 
 // /authorize and the approval, up to the login method's redirect; returns the callback path and the PKCE verifier
 async function beginLogin(client, name) {
-  const { loginState, verifier } = await openApproval(client, name);
-  const r = await approve(loginState);
+  const { loginState, verifier, cookie } = await openApproval(client, name);
+  const r = await approve(loginState, cookie);
   assert.equal(r.status, 302, await r.text());
-  return { callback: r.headers.get("location"), verifier };
+  return { callback: r.headers.get("location"), verifier, cookie };
 }
 
 // the whole browser leg: /authorize, the login method, /login/callback; returns the code
 async function authorizeAs(client, name, begin = beginLogin) {
-  const { callback, verifier } = await begin(client, name);
-  const r = await get(callback);
+  const begun = await begin(client, name);
+  const { verifier } = begun;
+  const r = await callBack(begun);
   assert.equal(r.status, 302, await r.text());
   const back = new URL(r.headers.get("location"));
   assert.equal(`${back.origin}${back.pathname}`, REDIRECT_URI);
@@ -206,13 +222,13 @@ async function authorizeAs(client, name, begin = beginLogin) {
   return { code, verifier };
 }
 
-async function exchange(client, code, verifier) {
+async function exchange(client, code, verifier, redirectUri = REDIRECT_URI) {
   return form("/token", {
     grant_type: "authorization_code",
     code,
     code_verifier: verifier,
     client_id: client.client_id,
-    redirect_uri: REDIRECT_URI,
+    redirect_uri: redirectUri,
   });
 }
 
@@ -307,8 +323,7 @@ await check("an authorization code works once only", async () => {
 });
 
 await check("a refused person gets a 403 page and no code", async () => {
-  const { callback } = await beginLogin(claude, "bob");
-  const r = await get(callback);
+  const r = await callBack(await beginLogin(claude, "bob"));
   assert.equal(r.status, 403);
   assert.equal(r.headers.get("location"), null);
   const page = await r.text();
@@ -328,17 +343,17 @@ await check("an unknown, reused or expired login state gets a plain 400 page", a
   const missing = await get("/login/callback");
   assert.equal(missing.status, 400);
 
-  const { callback } = await beginLogin(claude, "carol");
-  const used = await get(callback);
+  const begun = await beginLogin(claude, "carol");
+  const used = await callBack(begun);
   assert.equal(used.status, 302);
   secrets.add(new URL(used.headers.get("location")).searchParams.get("code"));
-  const reused = await get(callback);
+  const reused = await callBack(begun);
   assert.equal(reused.status, 400);
   assert.match(await reused.text(), /This login link has expired, start again from Claude/);
 
   const late = await beginLogin(claude, "carol");
   clock += 11 * MINUTE;
-  const expired = await get(late.callback);
+  const expired = await callBack(late);
   assert.equal(expired.status, 400);
   assert.match(await expired.text(), /This login link has expired, start again from Claude/);
 });
@@ -366,23 +381,81 @@ await check("/authorize shows an approval page naming the app and where it retur
 });
 
 await check("a login that was not approved is refused at the callback", async () => {
-  const { loginState } = await openApproval(claude, "alice");
-  const r = await get(`/login/callback?state=${encodeURIComponent(loginState)}&as=alice`);
+  const { loginState, cookie } = await openApproval(claude, "alice");
+  const r = await get(`/login/callback?state=${encodeURIComponent(loginState)}&as=alice`, { headers: { cookie } });
   assert.equal(r.status, 400);
   assert.match(await r.text(), /This login link has expired, start again from Claude/);
   // and the state is spent: approving it afterwards does not revive it
-  assert.equal((await approve(loginState)).status, 400);
+  assert.equal((await approve(loginState, cookie)).status, 400);
 });
 
 await check("an unknown or expired approval gets the start-again page", async () => {
   const unknown = await approve("nope");
   assert.equal(unknown.status, 400);
   assert.match(await unknown.text(), /This login link has expired, start again from Claude/);
-  const { loginState } = await openApproval(claude, "alice");
+  const { loginState, cookie } = await openApproval(claude, "alice");
   clock += 11 * MINUTE;
-  const late = await approve(loginState);
+  const late = await approve(loginState, cookie);
   assert.equal(late.status, 400);
   assert.match(await late.text(), /This login link has expired, start again from Claude/);
+});
+
+await check("an approval from a browser that did not see the approval page is refused", async () => {
+  const { loginState, cookie } = await openApproval(claude, "alice");
+  for (const [why, r] of [
+    ["no cookie", await approve(loginState)],
+    ["wrong cookie", await approve(loginState, "lm_login=not-the-nonce")],
+    ["foreign origin", await approve(loginState, cookie, { origin: "https://attacker.example.net" })],
+  ]) {
+    assert.equal(r.status, 400, why);
+    assert.match(await r.text(), /This login link has expired, start again from Claude/, why);
+    assert.equal(r.headers.get("location"), null, why);
+  }
+  // none of those spent it: the browser that saw the page can still approve, and the same origin is fine
+  const r = await approve(loginState, cookie, { origin: PUBLIC_URL });
+  assert.equal(r.status, 302);
+});
+
+await check("a callback without the login cookie is refused, and the cookie is cleared after the callback", async () => {
+  const begun = await beginLogin(claude, "carol");
+  const bare = await get(begun.callback);
+  assert.equal(bare.status, 400);
+  assert.match(await bare.text(), /This login link has expired, start again from Claude/);
+
+  const again = await beginLogin(claude, "carol");
+  const wrong = await callBack({ ...again, cookie: "lm_login=not-the-nonce" });
+  assert.equal(wrong.status, 400);
+
+  const ok = await beginLogin(claude, "carol");
+  const r = await callBack(ok);
+  assert.equal(r.status, 302);
+  secrets.add(new URL(r.headers.get("location")).searchParams.get("code"));
+  const cleared = r.headers.getSetCookie().find((c) => c.startsWith("lm_login="));
+  assert.ok(cleared, "the callback clears the login cookie");
+  assert.match(cleared, /Max-Age=0/);
+  assert.match(cleared, /Path=\/login(;|$)/);
+});
+
+await check("a malformed or oversize approval body gets a plain page with no stack trace", async () => {
+  const marker = "body-marker-7f3a";
+  const big = await fetch(running.base + "/login", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: `loginState=${marker}${"x".repeat(8 * 1024)}`,
+  });
+  const charset = await fetch(running.base + "/login", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded; charset=x-not-a-charset" },
+    body: `loginState=${marker}`,
+  });
+  for (const [why, r] of [["oversize", big], ["bad charset", charset]]) {
+    assert.equal(r.status, 400, why);
+    assert.match(r.headers.get("content-type") ?? "", /text\/html/, why);
+    const page = await r.text();
+    assert.doesNotMatch(page, /\bat /, `${why}: no stack trace`);
+    assert.doesNotMatch(page, /Error/, `${why}: no error name`);
+    assert.ok(!page.includes(marker), `${why}: no request content`);
+  }
 });
 
 await check("refresh rotates the token; the old one works only within 60 seconds and gives the same pair", async () => {
@@ -732,7 +805,7 @@ async function startHa() {
 
 // /authorize, Approve, then HA's authorize page as `user`; returns our callback path and the PKCE verifier
 async function haBeginLogin(client, user) {
-  const { callback: toHa, verifier } = await beginLogin(client, user);
+  const { callback: toHa, verifier, cookie } = await beginLogin(client, user);
   const u = new URL(toHa);
   assert.equal(`${u.origin}${u.pathname}`, `${haBase}/auth/authorize`);
   assert.deepEqual([...u.searchParams.keys()].sort(), ["client_id", "redirect_uri", "response_type", "state"]);
@@ -745,7 +818,7 @@ async function haBeginLogin(client, user) {
   assert.equal(r.status, 302, await r.text());
   const back = new URL(r.headers.get("location"));
   assert.equal(`${back.origin}${back.pathname}`, HA_REDIRECT_URI);
-  return { callback: `${back.pathname}${back.search}`, verifier };
+  return { callback: `${back.pathname}${back.search}`, verifier, cookie };
 }
 
 const haLogin = (client, user) => login(client, user, haBeginLogin);
@@ -775,8 +848,7 @@ await check("an HA admin connects end to end and lists tools", async () => {
 });
 
 await check("a non-admin is refused and their HA session is revoked", async () => {
-  const { callback } = await haBeginLogin(claudeHa, "plain-user");
-  const r = await get(callback);
+  const r = await callBack(await haBeginLogin(claudeHa, "plain-user"));
   assert.equal(r.status, 403);
   assert.equal(r.headers.get("location"), null);
   const page = await r.text();
@@ -792,8 +864,7 @@ await check("a non-admin is refused and their HA session is revoked", async () =
 
 await check("an admin login after a refused one from the same client works", async () => {
   const client = await register();
-  const { callback } = await haBeginLogin(client, "plain-user");
-  assert.equal((await get(callback)).status, 403);
+  assert.equal((await callBack(await haBeginLogin(client, "plain-user"))).status, 403);
   assert.deepEqual(ha.live("plain-user"), [], "the refusal leaves no HA session behind");
   const tokens = await haLogin(client, "admin-user");
   assert.equal(await mcpStatus(tokens.access_token), 200);
@@ -897,11 +968,11 @@ await check("an expired or unknown login state shows the start-again page with 4
 });
 
 await check("HA unreachable during login shows a readable error page", async () => {
-  const { callback } = await haBeginLogin(claudeHa, "admin-user");
+  const begun = await haBeginLogin(claudeHa, "admin-user");
   await haStop();
   let r;
   try {
-    r = await get(callback);
+    r = await callBack(begun);
   } finally {
     await haListen();
   }

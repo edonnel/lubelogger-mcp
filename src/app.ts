@@ -7,7 +7,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { HomeAssistantLogin } from "./auth/homeassistant.js";
 import type { LoginMethod } from "./auth/login-method.js";
 import { LoginProvider } from "./auth/provider.js";
-import { mountOAuth } from "./auth/routes.js";
+import { mountOAuth, plainErrorPage } from "./auth/routes.js";
 import { AuthStore } from "./auth/store.js";
 import type { Config } from "./config.js";
 import { LubeLoggerClient } from "./lubelogger.js";
@@ -89,7 +89,10 @@ export async function createApp(
     });
 
     const store = await AuthStore.open(config.DATA_DIR, deps.now);
-    const provider = new LoginProvider(store, method, deps.now, { allowedRedirectHosts: config.ALLOWED_REDIRECT_HOSTS });
+    const provider = new LoginProvider(store, method, deps.now, {
+      allowedRedirectHosts: config.ALLOWED_REDIRECT_HOSTS,
+      publicUrl,
+    });
     endpoint = OAUTH_ENDPOINT;
     guard = mountOAuth(app, { publicUrl, provider });
     close = () => provider.close();
@@ -121,6 +124,9 @@ export async function createApp(
   };
   app.get(endpoint, guard, methodNotAllowed);
   app.delete(endpoint, guard, methodNotAllowed);
+
+  // OAuth modes serve browser pages, which must never show a stack trace; token mode is left as it was
+  if (config.AUTH_MODE !== "token") app.use(plainErrorPage);
 
   return { app, close };
 }

@@ -1,7 +1,7 @@
 // The OAuth authorization server toward Claude. The SDK's router handles the protocol (discovery, registration,
 // PKCE, the token and revoke endpoints); this provider issues and checks tokens, and delegates "who are you"
 // to a LoginMethod. No token, code or login state is ever written to a log: only people's names.
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type express from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
@@ -24,14 +24,25 @@ export const ACCESS_TOKEN_TTL_MS = 60 * 60_000;
 export const LOGIN_STATE_TTL_MS = 10 * 60_000;
 export const CODE_TTL_MS = 10 * 60_000;
 
+/** Binds a login to the browser that saw the approval page. Path=/login covers /login and /login/callback. */
+const LOGIN_COOKIE = "lm_login";
+const COOKIE_ATTRIBUTES = "HttpOnly; Secure; SameSite=Lax; Path=/login";
+
 const EXPIRED_LINK = "This login link has expired, start again from Claude.";
 
 export const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com"];
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
-// approved: the person pressed Approve on our page; only then is the login method's answer accepted
-type LoginState = { clientId: string; params: AuthorizationParams; createdAt: number; approved: boolean };
+// approved: the person pressed Approve on our page; only then is the login method's answer accepted.
+// browserHash: the SHA-256 of the nonce in the approval page's cookie, which approval and callback must present.
+type LoginState = {
+  clientId: string;
+  params: AuthorizationParams;
+  createdAt: number;
+  approved: boolean;
+  browserHash: string;
+};
 
 type PendingCode = {
   clientId: string;
@@ -82,7 +93,7 @@ function sendPage(res: express.Response, status: number, title: string, body: st
     );
 }
 
-function page(res: express.Response, status: number, title: string, message: string): void {
+export function page(res: express.Response, status: number, title: string, message: string): void {
   sendPage(res, status, title, `<p>${escapeHtml(message)}</p>`);
 }
 
@@ -101,6 +112,28 @@ function allowedRedirectHost(uri: string, allowed: readonly string[]): string | 
   return undefined;
 }
 
+/** The login cookie's value from a Cookie header, or "". */
+function loginCookie(req: express.Request): string {
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === LOGIN_COOKIE) return part.slice(eq + 1).trim();
+  }
+  return "";
+}
+
+/** True when the request carries the cookie whose nonce hashes to `browserHash`. */
+function sameBrowser(req: express.Request, browserHash: string): boolean {
+  const nonce = loginCookie(req);
+  if (!nonce) return false;
+  const a = Buffer.from(hashToken(nonce), "hex");
+  const b = Buffer.from(browserHash, "hex");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function clearLoginCookie(res: express.Response): void {
+  res.append("Set-Cookie", `${LOGIN_COOKIE}=; ${COOKIE_ATTRIBUTES}; Max-Age=0`);
+}
+
 export class LoginProvider implements OAuthServerProvider {
   private readonly states = new Map<string, LoginState>();
   // codes, access tokens and recent rotations are keyed by the SHA-256 of the secret, never the secret itself
@@ -114,13 +147,17 @@ export class LoginProvider implements OAuthServerProvider {
 
   private readonly allowedRedirectHosts: readonly string[];
 
+  // the origin a browser posting the approval form reports, when it reports one
+  private readonly publicOrigin: string | undefined;
+
   constructor(
     private readonly store: AuthStore,
     private readonly method: LoginMethod,
     private readonly now: () => number = Date.now,
-    opts: { allowedRedirectHosts?: readonly string[] } = {},
+    opts: { allowedRedirectHosts?: readonly string[]; publicUrl?: string } = {},
   ) {
     this.allowedRedirectHosts = opts.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS;
+    this.publicOrigin = opts.publicUrl ? new URL(opts.publicUrl).origin : undefined;
     this.clientsStore = {
       getClient: (id) => store.getClient(id),
       registerClient: async (client) => {
@@ -147,7 +184,18 @@ export class LoginProvider implements OAuthServerProvider {
     }
 
     const loginState = newSecret();
-    this.states.set(loginState, { clientId: client.client_id, params, createdAt: this.now(), approved: false });
+    const nonce = newSecret();
+    this.states.set(loginState, {
+      clientId: client.client_id,
+      params,
+      createdAt: this.now(),
+      approved: false,
+      browserHash: hashToken(nonce),
+    });
+    res.append(
+      "Set-Cookie",
+      `${LOGIN_COOKIE}=${nonce}; ${COOKIE_ATTRIBUTES}; Max-Age=${Math.floor(LOGIN_STATE_TTL_MS / 1000)}`,
+    );
 
     const name = client.client_name?.trim() ? client.client_name.trim() : "An unnamed app";
     sendPage(
@@ -176,6 +224,13 @@ export class LoginProvider implements OAuthServerProvider {
         page(res, 400, "Login expired", EXPIRED_LINK);
         return;
       }
+      // only the browser that was shown the approval page may press Approve: a form posted from another
+      // site carries a foreign Origin, or no login cookie. The state is kept, so the real page still works
+      const origin = req.headers.origin;
+      if ((origin !== undefined && origin !== this.publicOrigin) || !sameBrowser(req, entry.browserHash)) {
+        page(res, 400, "Login expired", EXPIRED_LINK);
+        return;
+      }
       entry.approved = true;
       await this.method.start(loginState, res);
     } catch (err) {
@@ -190,9 +245,15 @@ export class LoginProvider implements OAuthServerProvider {
       this.sweep();
       const loginState = typeof req.query.state === "string" ? req.query.state : "";
       const entry = this.states.get(loginState);
-      // single use: gone before the login method is even asked
+      // single use: gone before the login method is even asked, and the browser's cookie with it
       if (entry) this.states.delete(loginState);
-      if (!entry || !entry.approved || this.now() - entry.createdAt > LOGIN_STATE_TTL_MS) {
+      clearLoginCookie(res);
+      if (
+        !entry ||
+        !entry.approved ||
+        this.now() - entry.createdAt > LOGIN_STATE_TTL_MS ||
+        !sameBrowser(req, entry.browserHash)
+      ) {
         page(res, 400, "Login expired", EXPIRED_LINK);
         return;
       }
