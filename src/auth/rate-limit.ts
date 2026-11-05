@@ -4,6 +4,9 @@
 
 export const MAX_FAILURES = 5;
 export const WINDOW_MS = 15 * 60_000;
+/** The most keys held at once. Past it, the oldest key that is not locked makes room. */
+export const MAX_KEYS = 50_000;
+const MAX_KEY_LENGTH = 200;
 const PRUNE_EVERY_MS = 60_000;
 
 export class FailureLimiter {
@@ -18,8 +21,8 @@ export class FailureLimiter {
   lockedFor(keys: readonly string[]): number {
     const now = this.now();
     let wait = 0;
-    for (const key of keys) {
-      const counted = this.counted(key, now);
+    for (const raw of keys) {
+      const counted = this.counted(raw.slice(0, MAX_KEY_LENGTH), now);
       const oldest = counted[0];
       if (oldest !== undefined && counted.length >= MAX_FAILURES) wait = Math.max(wait, oldest + WINDOW_MS - now);
     }
@@ -30,16 +33,24 @@ export class FailureLimiter {
   fail(keys: readonly string[]): void {
     const now = this.now();
     this.prune(now);
-    for (const key of keys) {
-      const counted = this.counted(key, now);
+    for (const raw of keys) {
+      const key = raw.slice(0, MAX_KEY_LENGTH);
+      if (!this.failures.has(key) && this.failures.size >= MAX_KEYS && !this.makeRoom(now)) continue;
+      // only the newest MAX_FAILURES matter: the oldest of them decides when a locked key is free
+      const counted = this.counted(key, now).slice(1 - MAX_FAILURES);
       counted.push(now);
       this.failures.set(key, counted);
     }
   }
 
-  /** How many keys are held. Exists so a test can check that expired keys are dropped. */
+  /** How many keys are held. Exists so a test can check that keys are dropped. */
   size(): number {
     return this.failures.size;
+  }
+
+  /** How many timestamps are held for a key. Exists so a test can check they stay capped. */
+  held(key: string): number {
+    return this.failures.get(key.slice(0, MAX_KEY_LENGTH))?.length ?? 0;
   }
 
   /** The failures of a key that are still inside the window, oldest first. */
@@ -53,5 +64,18 @@ export class FailureLimiter {
     for (const [key, times] of this.failures) {
       if (!times.some((at) => now - at < WINDOW_MS)) this.failures.delete(key);
     }
+  }
+
+  /** Frees one slot: expired keys first (swept at most once a minute, so a flood cannot force a scan per request), then the oldest key that is not locked. False when every key is locked. */
+  private makeRoom(now: number): boolean {
+    this.prune(now);
+    if (this.failures.size < MAX_KEYS) return true;
+    for (const [key, times] of this.failures) {
+      if (times.filter((at) => now - at < WINDOW_MS).length < MAX_FAILURES) {
+        this.failures.delete(key);
+        return true;
+      }
+    }
+    return false;
   }
 }

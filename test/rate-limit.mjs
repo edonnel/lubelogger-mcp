@@ -1,6 +1,6 @@
 // The failed sign-in limiter, driven by an injected clock so nothing sleeps.
 import assert from "node:assert/strict";
-import { FailureLimiter, MAX_FAILURES, WINDOW_MS } from "../dist/auth/rate-limit.js";
+import { FailureLimiter, MAX_FAILURES, MAX_KEYS, WINDOW_MS } from "../dist/auth/rate-limit.js";
 
 let failed = 0;
 async function check(name, fn) {
@@ -57,10 +57,46 @@ await check("a locked username locks every address that tries it, and a locked a
 await check("memory stays bounded", () => {
   const { clock, limiter } = make();
   for (let i = 0; i < 100_000; i++) limiter.fail([`addr:${i}`]);
-  assert.equal(limiter.size(), 100_000);
+  assert.ok(limiter.size() <= MAX_KEYS);
   clock.t += WINDOW_MS + 1;
   limiter.fail(["addr:last"]);
   assert.equal(limiter.size(), 1);
+});
+
+await check("a flood of distinct live keys stays within MAX_KEYS and keeps earlier lockouts", () => {
+  const { limiter } = make();
+  for (let i = 0; i < MAX_FAILURES; i++) limiter.fail(["user:locked"]);
+  for (let i = 0; i < MAX_KEYS + 10_000; i++) limiter.fail([`addr:${i}`]);
+  assert.ok(limiter.size() <= MAX_KEYS);
+  assert.ok(limiter.lockedFor(["user:locked"]) > 0);
+});
+
+await check("when every key is locked, a new key is not tracked", () => {
+  const { limiter } = make();
+  for (let i = 0; i < MAX_KEYS; i++) for (let j = 0; j < MAX_FAILURES; j++) limiter.fail([`k${i}`]);
+  assert.equal(limiter.size(), MAX_KEYS);
+  limiter.fail(["new"]);
+  assert.equal(limiter.size(), MAX_KEYS);
+  assert.equal(limiter.held("new"), 0);
+  assert.ok(limiter.lockedFor(["k0"]) > 0);
+});
+
+await check("a key that fails 100 times holds at most MAX_FAILURES timestamps and stays locked", () => {
+  const { clock, limiter } = make();
+  for (let i = 0; i < 100; i++) {
+    limiter.fail(["user:spam"]);
+    clock.t += 1000;
+  }
+  assert.equal(limiter.held("user:spam"), MAX_FAILURES);
+  assert.ok(limiter.lockedFor(["user:spam"]) > 0);
+});
+
+await check("keys that differ only after character 200 are the same key", () => {
+  const { limiter } = make();
+  const base = "u".repeat(200);
+  for (let i = 0; i < MAX_FAILURES; i++) limiter.fail([base + i]);
+  assert.equal(limiter.size(), 1);
+  assert.ok(limiter.lockedFor([base + "other"]) > 0);
 });
 
 if (failed) {
