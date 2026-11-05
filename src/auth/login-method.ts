@@ -24,3 +24,27 @@ export interface LoginMethod {
   /** End the upstream session of a connection that is going away. */
   cleanup(upstream: Record<string, unknown>): Promise<void>;
 }
+
+/** What a person typed into a sign-in form. Each form fills only its own fields. */
+export type FormFields = { username?: string; password?: string; apiKey?: string };
+
+// Every message here may be shown on a page and logged, so none ever contains a typed password or key.
+export type FormCheckResult =
+  | { person: Person; upstream: Record<string, unknown> } // signed in
+  | { invalid: string } // wrong credentials: re-show the form, counts as a failure
+  | { refused: string; person?: Person } // real credentials, not allowed: "Not allowed" page
+  | { unavailable: string }; // LubeLogger unreachable or 5xx: try again shortly
+
+/** A login method that checks typed credentials on the sign-in screen instead of redirecting. */
+export interface FormLoginMethod {
+  readonly form: "password" | "key";
+  check(fields: FormFields): Promise<FormCheckResult>;
+  /** Re-check the person on each refresh. "unavailable" is for network errors and 5xx answers only. */
+  recheck(upstream: Record<string, unknown>): Promise<RecheckResult>;
+  /** End the upstream session of a connection that is going away. */
+  cleanup(upstream: Record<string, unknown>): Promise<void>;
+}
+
+export type AnyLoginMethod = LoginMethod | FormLoginMethod;
+
+export const isFormMethod = (m: AnyLoginMethod): m is FormLoginMethod => "check" in m;

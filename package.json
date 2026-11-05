@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "npm run build && node test/smoke.mjs && node test/auth-config.mjs && node test/auth-store.mjs && node test/oidc.mjs && node test/oauth-ha.mjs"
+    "test": "npm run build && node test/smoke.mjs && node test/auth-config.mjs && node test/auth-store.mjs && node test/oidc.mjs && node test/lubelogger-login.mjs &&node test/oauth-ha.mjs"
   },
   "license": "MIT",
   "dependencies": {
