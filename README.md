@@ -11,7 +11,8 @@ Every request it sends was checked against the LubeLogger 1.7.4 source: routes, 
 - **Refuses to start without a credential.** If `MCP_AUTH_TOKEN` is not set, `MCP_PATH` must contain a random segment of at least 32 characters, e.g. `/mcp/<output of: openssl rand -hex 16>`. Upstream printed a warning and served the endpoint to anyone who could reach it.
 - **Keeps a custom `MCP_PATH` out of the log.** Upstream printed it in its startup line, and for clients that cannot send a bearer token (the Claude app) that path is the only credential.
 - **Patched dependencies**, lockfile only: `body-parser` 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), denial of service) and `fast-uri` 3.1.9 ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) and related).
-- **Sign in with Home Assistant (OAuth).** With `AUTH_METHODS=homeassistant`, the Claude app connects through a plain `https://<host>/mcp` URL and a Home Assistant login instead of a secret path. `AUTH_METHODS` is a list of sign-in methods, so more can be added later; `AUTH_MODE=homeassistant` still works and means the same thing. Only Home Assistant admins (`is_admin`) can connect. See [Sign in with Home Assistant](#sign-in-with-home-assistant-oauth). With neither set, `AUTH_MODE` defaults to `token`, the behaviour above.
+- **Sign in with Home Assistant (OAuth).** With `AUTH_METHODS=homeassistant`, the Claude app connects through a plain `https://<host>/mcp` URL and a Home Assistant login instead of a secret path. `AUTH_METHODS` is a list of sign-in methods, so more can be added alongside it; `AUTH_MODE=homeassistant` still works and means the same thing. Only Home Assistant admins (`is_admin`) can connect. See [Sign in with Home Assistant](#sign-in-with-home-assistant-oauth). With neither set, `AUTH_MODE` defaults to `token`, the behaviour above.
+- **Sign in with OpenID Connect.** Add `oidc` to `AUTH_METHODS` to let people sign in with any standard OpenID Connect provider (Google, Authentik, Keycloak and so on). It can run alongside Home Assistant, as a second button on the same sign-in screen. See [Sign in with OpenID Connect](#sign-in-with-openid-connect).
 - Tests for all of the above in `test/smoke.mjs`, and a `.gitattributes` that keeps line endings LF.
 - **Follows LubeLogger's "Odometer Optional" setting.** Service, repair, upgrade and fuel records for those vehicles can leave the odometer out; it is saved as 0, which LubeLogger shows as a blank odometer, matching its own form. `list_vehicles` marks these vehicles, and Claude treats the reading as a suggestion for them. Upstream required it for every vehicle.
 - **Edits existing records.** `list_records` finds them and `propose_record_update` changes only the fields given, through the same preview-and-confirm flow. LubeLogger's update endpoints overwrite every field, so the update starts from the full record and keeps attachments, extra fields and fuel charge levels. Upstream was add-only.
@@ -105,13 +106,14 @@ cp .env.example .env
 | `LUBELOGGER_API_KEY` | required | Sent as the `x-api-key` header |
 | `MCP_AUTH_TOKEN` | unset | If set, every MCP request needs `Authorization: Bearer <token>`. If unset, `MCP_PATH` must hold a secret segment or the server will not start |
 | `MCP_PATH` | `/mcp` | Without `MCP_AUTH_TOKEN`, must contain a random segment of at least 32 characters, e.g. `/mcp/<output of: openssl rand -hex 16>`. A custom path is never printed in the log |
-| `AUTH_METHODS` | unset | Comma-separated sign-in methods for OAuth: `homeassistant`, `oidc`, `lubelogger-password` and `lubelogger-key`. Only `homeassistant` is available in this version; the others refuse to start with "is not available in this version". Never set it together with a non-token `AUTH_MODE` |
+| `AUTH_METHODS` | unset | Comma-separated sign-in methods for OAuth: `homeassistant`, `oidc`, `lubelogger-password` and `lubelogger-key`. `homeassistant` and `oidc` are available in this version, and both can be on at once; `lubelogger-password` and `lubelogger-key` refuse to start with "is not available in this version". Never set it together with a non-token `AUTH_MODE` |
 | `AUTH_MODE` | `token` | `token` is the bearer token or secret path above. `homeassistant` still works and means `AUTH_METHODS=homeassistant`. Setting `AUTH_METHODS` together with a non-token `AUTH_MODE` refuses to start |
-| `PUBLIC_URL` | unset | Home Assistant mode only, required. This server's public address, origin only with no path, e.g. `https://mcp.example.com` |
+| `PUBLIC_URL` | unset | Required when a sign-in method is on. This server's public address, origin only with no path, e.g. `https://mcp.example.com` |
 | `HOME_ASSISTANT_PUBLIC_URL` | unset | Home Assistant mode only, required. Home Assistant's address as your browser sees it, no path, e.g. `https://ha.example.com` |
 | `HOME_ASSISTANT_URL` | unset | Home Assistant mode only, required. Home Assistant's address as this server reaches it, no path, e.g. `http://homeassistant:8123` inside the add-on network |
-| `DATA_DIR` | `./data` | Home Assistant mode. Holds `oauth.json` with the registered clients and connections. Keep it private and back it up |
-| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | Home Assistant mode. Hosts a login code may be sent back to, comma-separated bare hostnames with no scheme or port. Only these hosts can register as clients. Add `localhost,127.0.0.1` for Claude Code |
+| `DATA_DIR` | `./data` | Sign-in modes. Holds `oauth.json` with the registered clients and connections. Keep it private and back it up |
+| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | Sign-in modes. Hosts a login code may be sent back to, comma-separated bare hostnames with no scheme or port. Only these hosts can register as clients. Add `localhost,127.0.0.1` for Claude Code |
+| `OIDC_*` | see below | The OpenID Connect settings, listed under [Sign in with OpenID Connect](#sign-in-with-openid-connect) |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | |
 | `CONFIRM_TTL_MINUTES` | `30` | How long a preview token stays valid |
 | `REQUEST_TIMEOUT_MS` | `15000` | Timeout for LubeLogger calls |
@@ -174,7 +176,7 @@ The sign-in screen has one button per method that is switched on. Only Home Assi
 
 **If it stops working for everyone.** Home Assistant's IP ban (`ip_ban_enabled`) is the one thing to watch: if it ever banned this server's address, every connection would end at its next refresh.
 
-**Switching a method off.** While the server still has other methods on, connections made with a method that has been switched off are removed, at the next start or at their next refresh, whichever comes first. Their sessions at the source are not revoked, because the server can only revoke through methods that are on, so delete them there yourself. For Home Assistant that is Profile, then Refresh tokens. In this version Home Assistant is the only method, so removing it puts the server back in token mode, which leaves the sign-in data alone: existing connections stay in the data file and work again if the method is switched back on within 90 days. The add-on will not start with no method switched on.
+**Switching a method off.** While the server still has other methods on, connections made with a method that has been switched off are removed, at the next start or at their next refresh, whichever comes first. If the switched-off method's settings are still in place, the server also revokes its sessions at the source (for Home Assistant the refresh token, for OpenID Connect the refresh token when the provider has a revocation endpoint), so there is nothing left to delete there. If the settings are gone, it cannot reach the source and does not try, so delete those sessions yourself. For Home Assistant that is Profile, then Refresh tokens. If the method you switch off is the only one on, the server goes back to token mode, which leaves the sign-in data alone: existing connections stay in the data file and work again if the method is switched back on within 90 days. The add-on will not start with no method switched on.
 
 The startup log says which methods are on: `auth homeassistant`, or `auth token` in token mode.
 
@@ -207,6 +209,51 @@ Two things differ from the Claude app:
 - Claude Code receives the login on `http://localhost:<port>` on your own machine, so those hosts must be allowed: `ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,localhost,127.0.0.1` (in the add-on, the `allowed_redirect_hosts` option). Entries are bare hostnames, with no scheme or port.
 - Claude Code calls the server from your machine, not from Anthropic's cloud, so it does not work with the Anthropic-only Cloudflare rule below. Use one or the other.
 
+## Sign in with OpenID Connect
+
+OpenID Connect (OIDC) lets people sign in with an account at a provider you already use, such as Google, Authentik, Keycloak or Authelia. Add `oidc` to `AUTH_METHODS`, on its own or next to `homeassistant`. With both on, the sign-in screen shows one button for each and the person picks. The rest of the flow, the connector URL and the 1-hour access tokens are the same as for Home Assistant.
+
+```env
+AUTH_METHODS=oidc
+PUBLIC_URL=https://mcp.example.com
+OIDC_ISSUER=https://idp.example.com/realms/home
+OIDC_CLIENT_ID=lubelogger-mcp
+OIDC_ALLOWED_EMAILS=alice@example.com
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OIDC_ISSUER` | required | The provider's address, e.g. `https://idp.example.com/realms/home`. It may have a path. It must be `https`; plain `http` is accepted only for `localhost` and `127.0.0.1`, for testing |
+| `OIDC_CLIENT_ID` | required | The client id the provider gave you |
+| `OIDC_CLIENT_SECRET` | unset | The client secret, if the client is confidential. Leave it out for a public client |
+| `OIDC_DISPLAY_NAME` | `single sign-on` | The name on the sign-in button |
+| `OIDC_ALLOWED_EMAILS` | unset | Comma-separated emails that may sign in. An email counts only if the provider marks it verified (`email_verified` is true) |
+| `OIDC_ALLOWED_SUBJECTS` | unset | Comma-separated subject ids (the `sub` claim) that may sign in |
+| `OIDC_REQUIRED_GROUP` | unset | A group whose members may sign in |
+| `OIDC_GROUPS_CLAIM` | `groups` | The ID token claim that lists a person's groups |
+| `OIDC_AUTH_PARAMS` | unset | Extra query parameters added to the sign-in request, e.g. `access_type=offline&prompt=consent` |
+
+**Who may sign in.** At least one of `OIDC_ALLOWED_EMAILS`, `OIDC_ALLOWED_SUBJECTS` and `OIDC_REQUIRED_GROUP` is required, and the server refuses to start with none of them, so "anyone with an account at the provider" is never the default. A person is allowed if any one of them matches. An email in `OIDC_ALLOWED_EMAILS` matches only when the provider says it is verified. The server always verifies the ID token's signature.
+
+**Register the client at the provider.**
+
+1. Create an OpenID Connect client (sometimes called an application). A confidential client with a secret or a public client both work.
+2. Set its redirect URI to `https://mcp.example.com/login/callback`, where the host is your `PUBLIC_URL`.
+3. Allow the `openid`, `email` and `profile` scopes. For `OIDC_REQUIRED_GROUP`, make sure the provider puts groups in the ID token under the claim named by `OIDC_GROUPS_CLAIM`.
+4. Copy the client id (and the secret, if any) into the settings above.
+
+**Refresh tokens.** The connection stays alive by refreshing at the provider every hour, which needs a refresh token. A provider that issues none ends the connection within the hour, when the ID token it started with expires, and the person signs in again. Google only issues a refresh token when asked for one, so set
+
+```env
+OIDC_AUTH_PARAMS=access_type=offline&prompt=consent
+```
+
+Each refresh checks the allowlist again, so removing someone from `OIDC_ALLOWED_EMAILS`, or from the group, disconnects them at their next refresh. If the provider completes a refresh but the answer is lost on the way, for example by a timeout, the retry is refused and the person signs in again.
+
+**Disconnect.** When a connection ends, the server revokes its refresh token at the provider, if the provider has a revocation endpoint. Without one, end the session at the provider.
+
+**In the Home Assistant add-on.** Tick the **oidc** checkbox (it is off by default) and fill in the `oidc_*` options, which match the variables above: `oidc_issuer`, `oidc_client_id`, `oidc_client_secret`, `oidc_display_name`, `oidc_allowed_emails`, `oidc_allowed_subjects`, `oidc_required_group`, `oidc_groups_claim` and `oidc_auth_params`. The add-on will not start while the checkbox is on and the issuer, the client id or all three allowlist options are missing; it names the option in the log without printing values.
+
 ## Lock it down with Cloudflare
 
 If the server is public through Cloudflare, you can have Cloudflare refuse requests that do not come from Anthropic's cloud, apart from the browser sign-in paths. It is optional once OAuth is on, because the sign-in already protects `/mcp`. In token mode with a secret path it is the main extra protection, since the path is the only credential. It rules out Claude Code, which calls from your own machine.
@@ -220,6 +267,7 @@ In the Cloudflare dashboard, open the zone, then **Security → WAF → Custom r
 - The two ranges are Anthropic's published addresses, listed on [Anthropic's IP addresses page](https://docs.anthropic.com/en/api/ip-addresses). They can change, so check that page again if Claude stops reaching the server.
 - The OAuth endpoints that Claude's servers call (`/.well-known/…`, `/register`, `/token`, `/revoke`) come from Anthropic's addresses, so the IP clause already lets them through.
 - The path clause leaves the browser sign-in paths open, because you reach them from your own browser. In token mode there is no sign-in, so drop the last clause: `(http.host eq "mcp.example.com" and not ip.src in {160.79.104.0/21 153.61.208.0/20})`.
+- Your OpenID Connect provider needs no exception. This server calls the provider itself, so the provider never has to reach it through the rule, and your browser reaches the provider directly and returns to `/login/callback`, which the path clause already allows.
 - To check it, request the connector URL from outside, for example `curl -i https://mcp.example.com/mcp` from your own machine. It should answer 403. Connecting from Claude should still work.
 
 ## Security notes

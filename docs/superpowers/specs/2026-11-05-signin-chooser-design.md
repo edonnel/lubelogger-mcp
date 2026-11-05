@@ -104,5 +104,5 @@ This replaces the approved design's three releases. Each step can be tested and 
 
 ## Carried into step 2 (from step 1's final review)
 
-- **Revoke a switched-off method's upstream sessions when its settings are still present.** Step 1 only revokes through methods that are on. With a single method there was nothing to reach, since removing it returns the server to token mode. Step 2 adds a second method, so it has to build the switched-off method from its remaining settings for cleanup, as "Connections" above describes.
-- **Test that a `loginState` locked to one method refuses a second method.** This is listed under "Left to the builder". It could only be written once there were two real methods.
+- **Done. Revoke a switched-off method's upstream sessions when its settings are still present.** Step 1 only revokes through methods that are on. With a single method there was nothing to reach, since removing it returns the server to token mode. Step 2 adds a second method, so it has to build the switched-off method from its remaining settings for cleanup, as "Connections" above describes. Covered by `a switched-off method that is still configured has its upstream session revoked` in `test/oauth-ha.mjs`.
+- **Done. Test that a `loginState` locked to one method refuses a second method.** This is listed under "Left to the builder". It could only be written once there were two real methods. Covered by `a login state locked to one method refuses a second` in `test/oauth-ha.mjs`.
