@@ -40,13 +40,20 @@ const mock = {
   users: new Map([
     ["alice", "pw-alice"],
     ["bob", "pw-bob"],
+    // real accounts whose names match words the methods use for their own results
+    ["rejected", "pw-rejected"],
+    ["unavailable", "pw-unavailable"],
   ]),
   keys: new Map([["key-alice", "alice"]]),
   authOff: false,
   status: undefined,
   requests: [],
   reset() {
-    this.keys = new Map([["key-alice", "alice"]]);
+    this.keys = new Map([
+      ["key-alice", "alice"],
+      ["key-rejected", "rejected"],
+      ["key-unavailable", "unavailable"],
+    ]);
     this.authOff = false;
     this.status = undefined;
     this.requests = [];
@@ -211,6 +218,19 @@ await check("cleanup does nothing and calls nothing", async () => {
   assert.equal(await password().cleanup({ username: "alice" }), undefined);
   assert.equal(await key().cleanup({ username: "alice", apiKey: "key-alice" }), undefined);
   assert.equal(mock.requests.length, 0);
+});
+
+await check("users named \"rejected\" and \"unavailable\" sign in like anyone else", async () => {
+  mock.reset();
+  for (const name of ["rejected", "unavailable"]) {
+    const person = { id: name, name };
+    const p = await run(() => password({ allowedUsers: [name] }).check({ username: name, password: `pw-${name}` }));
+    assert.deepEqual(p, { person, upstream: { username: name } });
+    const upstream = { username: name, apiKey: `key-${name}` };
+    const k = await run(() => key().check({ apiKey: `key-${name}` }));
+    assert.deepEqual(k, { person, upstream });
+    assert.deepEqual(await key().recheck(upstream), { ok: true, upstream, person });
+  }
 });
 
 await check("no password or key appears in any result message or thrown error", async () => {

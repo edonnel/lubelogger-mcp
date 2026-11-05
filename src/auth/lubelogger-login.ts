@@ -70,15 +70,18 @@ class Whoami {
  * Sorts a whoami answer for credentials into the person, "rejected" (a 4xx: LubeLogger said no) or
  * "unavailable" (a 5xx, a 200 without a username, or no answer at all).
  */
-async function identify(whoami: Whoami, headers: Record<string, string>): Promise<string | "rejected" | "unavailable"> {
+async function identify(
+  whoami: Whoami,
+  headers: Record<string, string>,
+): Promise<{ user: string } | { rejected: true } | { unavailable: true }> {
   let answer: { status: number; username?: string };
   try {
     answer = await whoami.ask(headers);
   } catch {
-    return "unavailable";
+    return { unavailable: true };
   }
-  if (answer.status === 200) return answer.username ?? "unavailable";
-  return answer.status >= 400 && answer.status < 500 ? "rejected" : "unavailable";
+  if (answer.status === 200) return answer.username ? { user: answer.username } : { unavailable: true };
+  return answer.status >= 400 && answer.status < 500 ? { rejected: true } : { unavailable: true };
 }
 
 export type LubeLoggerPasswordOptions = WhoamiOptions & {
@@ -111,10 +114,11 @@ export class LubeLoggerPasswordLogin implements FormLoginMethod {
     if (off) return { refused: LOGIN_OFF };
 
     const basic = Buffer.from(`${username}:${password}`, "utf8").toString("base64");
-    const who = await identify(this.whoami, { authorization: `Basic ${basic}` });
-    if (who === "unavailable") return { unavailable: UNAVAILABLE };
-    if (who === "rejected") return { invalid: WRONG_PASSWORD };
+    const answer = await identify(this.whoami, { authorization: `Basic ${basic}` });
+    if ("unavailable" in answer) return { unavailable: UNAVAILABLE };
+    if ("rejected" in answer) return { invalid: WRONG_PASSWORD };
 
+    const who = answer.user;
     const person = { id: who, name: who };
     if (!this.allowedUsers.has(who)) return { refused: notAllowed(who), person };
     return { person, upstream: { username: who } };
@@ -153,9 +157,10 @@ export class LubeLoggerKeyLogin implements FormLoginMethod {
     if (off === "unavailable") return { unavailable: UNAVAILABLE };
     if (off) return { refused: LOGIN_OFF };
 
-    const who = await identify(this.whoami, { "x-api-key": apiKey });
-    if (who === "unavailable") return { unavailable: UNAVAILABLE };
-    if (who === "rejected") return { invalid: WRONG_KEY };
+    const answer = await identify(this.whoami, { "x-api-key": apiKey });
+    if ("unavailable" in answer) return { unavailable: UNAVAILABLE };
+    if ("rejected" in answer) return { invalid: WRONG_KEY };
+    const who = answer.user;
     return { person: { id: who, name: who }, upstream: { username: who, apiKey } };
   }
 
@@ -168,10 +173,10 @@ export class LubeLoggerKeyLogin implements FormLoginMethod {
     if (off === "unavailable") return { ok: false, reason: "unavailable" };
     if (off) return { ok: false, reason: "refused" };
 
-    const who = await identify(this.whoami, { "x-api-key": apiKey });
-    if (who === "unavailable") return { ok: false, reason: "unavailable" };
+    const answer = await identify(this.whoami, { "x-api-key": apiKey });
+    if ("unavailable" in answer) return { ok: false, reason: "unavailable" };
     // a rejected key was deleted; a key now owned by someone else is not this connection's person
-    if (who === "rejected" || who !== username) return { ok: false, reason: "refused" };
+    if ("rejected" in answer || answer.user !== username) return { ok: false, reason: "refused" };
     return { ok: true, upstream: { username, apiKey }, person: { id: username, name: username } };
   }
 
