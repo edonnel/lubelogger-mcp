@@ -106,3 +106,14 @@ This replaces the approved design's three releases. Each step can be tested and 
 
 - **Done. Revoke a switched-off method's upstream sessions when its settings are still present.** Step 1 only revokes through methods that are on. With a single method there was nothing to reach, since removing it returns the server to token mode. Step 2 adds a second method, so it has to build the switched-off method from its remaining settings for cleanup, as "Connections" above describes. Covered by `a switched-off method that is still configured has its upstream session revoked` in `test/oauth-ha.mjs`.
 - **Done. Test that a `loginState` locked to one method refuses a second method.** This is listed under "Left to the builder". It could only be written once there were two real methods. Covered by `a login state locked to one method refuses a second` in `test/oauth-ha.mjs`.
+
+## Follow-ups after step 2 (from its reviews; none lets the wrong person in)
+
+- The startup purge waits on a retired method's cleanup, so a provider that drops packets can delay startup by up to 10 s per leftover connection, once. End switched-off connections without awaiting their cleanup.
+- When a refresh succeeds but the new ID token is refused, revoke the rotated refresh token best-effort, so the provider's session doesn't outlive the refusal.
+- A refreshed ID token without a `name` claim renames the person: fall back to the stored name before `sub`.
+- Refuse `OIDC_AUTH_PARAMS` that sets `client_id`, `response_type`, `response_mode`, `request` or `request_uri`.
+- Remove the unused `OidcLogin` error class `OidcRejected`.
+- Tests: the signature check on refresh, the timeout path, cleanup throwing, the real retired-method build, markup in `OIDC_DISPLAY_NAME`, per-check baselines for `stubOidc.started`, and a test helper that names which bad-token case failed.
+- Launcher: treat whitespace-only options as unset; test that `oidc` alone doesn't require `home_assistant_public_url`.
+- `.env.example`: one comment per allowlist setting, and the "Home Assistant mode" wording on `DATA_DIR` and `ALLOWED_REDIRECT_HOSTS`.
