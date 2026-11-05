@@ -105,6 +105,59 @@ check("oidc is not available in this version", () => {
   assert.ok(r.problems.some((p) => /not available in this version/.test(p)));
 });
 
+const ha = {
+  ...base,
+  PUBLIC_URL: "https://mcp.example.com",
+  HOME_ASSISTANT_PUBLIC_URL: "https://ha.example.com",
+  HOME_ASSISTANT_URL: "http://homeassistant:8123",
+};
+
+await check("AUTH_METHODS=homeassistant resolves to that list", () => {
+  const r = validateConfig({ ...ha, AUTH_METHODS: "homeassistant" });
+  assert.ok(r.ok, JSON.stringify(r.problems));
+  assert.deepEqual(r.config.AUTH_METHODS, ["homeassistant"]);
+});
+await check("AUTH_METHODS trims spaces around names", () => {
+  const r = validateConfig({ ...ha, AUTH_METHODS: " homeassistant " });
+  assert.deepEqual(r.config.AUTH_METHODS, ["homeassistant"]);
+});
+await check("AUTH_MODE=homeassistant still works and means the same list", () => {
+  const r = validateConfig({ ...ha, AUTH_MODE: "homeassistant" });
+  assert.deepEqual(r.config.AUTH_METHODS, ["homeassistant"]);
+});
+await check("token mode has no methods", () => {
+  const r = validateConfig({ ...base, MCP_AUTH_TOKEN: "x".repeat(24) });
+  assert.deepEqual(r.config.AUTH_METHODS, []);
+});
+await check("AUTH_METHODS refuses unknown, duplicate and empty lists", () => {
+  for (const [value, needle] of [
+    ["homeassistant,nope", /nope/],
+    ["homeassistant,homeassistant", /more than once/],
+    [",", /at least one/],
+  ]) {
+    const r = validateConfig({ ...ha, AUTH_METHODS: value });
+    assert.equal(r.ok, false);
+    assert.ok(r.problems.some((p) => p.startsWith("AUTH_METHODS") && needle.test(p)), r.problems.join("\n"));
+  }
+});
+await check("methods planned for later refuse to start", () => {
+  const r = validateConfig({ ...ha, AUTH_METHODS: "homeassistant,oidc" });
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => /oidc.*not available in this version/.test(p)));
+});
+await check("AUTH_METHODS with a non-token AUTH_MODE refuses to start", () => {
+  const r = validateConfig({ ...ha, AUTH_MODE: "homeassistant", AUTH_METHODS: "homeassistant" });
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => p.startsWith("AUTH_METHODS") && /AUTH_MODE/.test(p)));
+});
+await check("each method's settings are required only when it is on, and token conflicts still apply", () => {
+  const r = validateConfig({ ...base, AUTH_METHODS: "homeassistant", PUBLIC_URL: "https://mcp.example.com" });
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => p.startsWith("HOME_ASSISTANT_PUBLIC_URL") && /homeassistant/.test(p)));
+  const t = validateConfig({ ...ha, AUTH_METHODS: "homeassistant", MCP_AUTH_TOKEN: "x".repeat(24) });
+  assert.ok(t.problems.some((p) => p.startsWith("MCP_AUTH_TOKEN")));
+});
+
 // the add-on launcher: importing it does not run it
 const { buildEnv } = await import("../home-assistant/lubelogger_mcp/launch.mjs");
 const addonOptions = {
