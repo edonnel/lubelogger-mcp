@@ -11,7 +11,7 @@ Every request it sends was checked against the LubeLogger 1.7.4 source: routes, 
 - **Refuses to start without a credential.** If `MCP_AUTH_TOKEN` is not set, `MCP_PATH` must contain a random segment of at least 32 characters, e.g. `/mcp/<output of: openssl rand -hex 16>`. Upstream printed a warning and served the endpoint to anyone who could reach it.
 - **Keeps a custom `MCP_PATH` out of the log.** Upstream printed it in its startup line, and for clients that cannot send a bearer token (the Claude app) that path is the only credential.
 - **Patched dependencies**, lockfile only: `body-parser` 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), denial of service) and `fast-uri` 3.1.9 ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) and related).
-- **Sign in with Home Assistant (OAuth).** With `AUTH_MODE=homeassistant`, the Claude app connects through a plain `https://<host>/mcp` URL and a Home Assistant login instead of a secret path. Only Home Assistant admins (`is_admin`) can connect. See [Sign in with Home Assistant](#sign-in-with-home-assistant-oauth). `AUTH_MODE` defaults to `token`, the behaviour above.
+- **Sign in with Home Assistant (OAuth).** With `AUTH_METHODS=homeassistant`, the Claude app connects through a plain `https://<host>/mcp` URL and a Home Assistant login instead of a secret path. `AUTH_METHODS` is a list of sign-in methods, so more can be added later; `AUTH_MODE=homeassistant` still works and means the same thing. Only Home Assistant admins (`is_admin`) can connect. See [Sign in with Home Assistant](#sign-in-with-home-assistant-oauth). With neither set, `AUTH_MODE` defaults to `token`, the behaviour above.
 - Tests for all of the above in `test/smoke.mjs`, and a `.gitattributes` that keeps line endings LF.
 - **Follows LubeLogger's "Odometer Optional" setting.** Service, repair, upgrade and fuel records for those vehicles can leave the odometer out; it is saved as 0, which LubeLogger shows as a blank odometer, matching its own form. `list_vehicles` marks these vehicles, and Claude treats the reading as a suggestion for them. Upstream required it for every vehicle.
 - **Edits existing records.** `list_records` finds them and `propose_record_update` changes only the fields given, through the same preview-and-confirm flow. LubeLogger's update endpoints overwrite every field, so the update starts from the full record and keeps attachments, extra fields and fuel charge levels. Upstream was add-only.
@@ -105,7 +105,8 @@ cp .env.example .env
 | `LUBELOGGER_API_KEY` | required | Sent as the `x-api-key` header |
 | `MCP_AUTH_TOKEN` | unset | If set, every MCP request needs `Authorization: Bearer <token>`. If unset, `MCP_PATH` must hold a secret segment or the server will not start |
 | `MCP_PATH` | `/mcp` | Without `MCP_AUTH_TOKEN`, must contain a random segment of at least 32 characters, e.g. `/mcp/<output of: openssl rand -hex 16>`. A custom path is never printed in the log |
-| `AUTH_MODE` | `token` | How clients sign in. `token` is the bearer token or secret path above. `homeassistant` signs in with a Home Assistant admin account (see below). `oidc`, `lubelogger-key` and `lubelogger-password` are planned and refuse to start with "not available in this version" |
+| `AUTH_METHODS` | unset | Comma-separated sign-in methods for OAuth: `homeassistant`, `oidc`, `lubelogger-password` and `lubelogger-key`. Only `homeassistant` is available in this version; the others refuse to start with "is not available in this version". Never set it together with a non-token `AUTH_MODE` |
+| `AUTH_MODE` | `token` | `token` is the bearer token or secret path above. `homeassistant` still works and means `AUTH_METHODS=homeassistant`. Setting `AUTH_METHODS` together with a non-token `AUTH_MODE` refuses to start |
 | `PUBLIC_URL` | unset | Home Assistant mode only, required. This server's public address, origin only with no path, e.g. `https://mcp.example.com` |
 | `HOME_ASSISTANT_PUBLIC_URL` | unset | Home Assistant mode only, required. Home Assistant's address as your browser sees it, no path, e.g. `https://ha.example.com` |
 | `HOME_ASSISTANT_URL` | unset | Home Assistant mode only, required. Home Assistant's address as this server reaches it, no path, e.g. `http://homeassistant:8123` inside the add-on network |
@@ -139,17 +140,17 @@ In Home Assistant mode there is no bearer token: Claude Code signs in through OA
 
 **Claude app / claude.ai custom connector:** as far as I know, remote connectors are called from Anthropic's cloud, not from your phone or LAN. That means the URL must be reachable over public HTTPS (reverse proxy, Cloudflare Tunnel, Tailscale Funnel). Check Anthropic's current connector docs before relying on this, since it changes. The connector UI doesn't take a static bearer header (it supports OAuth or none), so there are two routes:
 
-- **Home Assistant sign-in (recommended).** Set `AUTH_MODE=homeassistant`, as described next. The connector URL is the plain `https://mcp.example.com/mcp`, and you log in to Home Assistant when you connect.
+- **Home Assistant sign-in (recommended).** Set `AUTH_METHODS=homeassistant`, as described next. The connector URL is the plain `https://mcp.example.com/mcp`, and you log in to Home Assistant when you connect.
 - **Secret path.** In the default `token` mode, set `MCP_PATH` to a long random path and treat that URL as a secret.
 
 ## Sign in with Home Assistant (OAuth)
 
-In `AUTH_MODE=homeassistant` this server is its own OAuth server and uses Home Assistant to prove who you are. There is no bearer token and no secret path to protect.
+With `AUTH_METHODS=homeassistant` this server is its own OAuth server and uses Home Assistant to prove who you are. There is no bearer token and no secret path to protect. (`AUTH_MODE=homeassistant` still works and means the same thing, but don't set both.)
 
 Set these in `.env` (or the add-on's Configuration tab):
 
 ```env
-AUTH_MODE=homeassistant
+AUTH_METHODS=homeassistant
 PUBLIC_URL=https://mcp.example.com
 HOME_ASSISTANT_PUBLIC_URL=https://ha.example.com
 HOME_ASSISTANT_URL=http://homeassistant:8123
@@ -164,14 +165,22 @@ HOME_ASSISTANT_URL=http://homeassistant:8123
 **Connect Claude.**
 
 1. In Claude, add a custom connector with the plain URL `https://mcp.example.com/mcp`.
-2. An approval page on this server names the app and where it returns to. Press Approve.
+2. A sign-in screen on this server, titled "Sign in to LubeLogger MCP", names the app and the host it returns to, and says "Only continue if you started this from Claude." Press **Continue with Home Assistant**. Pressing it counts as approving; there is no separate Approve step.
 3. Log in to Home Assistant. Claude is connected.
 
-Only Home Assistant admins (`is_admin`) can connect. Access tokens last 1 hour and Claude renews them in the background. A connection stays until it has gone 90 days without use.
+The sign-in screen has one button per method that is switched on. Only Home Assistant admins (`is_admin`) can connect. Access tokens last 1 hour and Claude renews them in the background. A connection stays until it has gone 90 days without use.
 
 **Disconnect.** In Home Assistant, open Profile, then Refresh tokens, and delete the entry. The connection ends at the next hourly refresh. A user who loses admin rights is disconnected at the next refresh too. If Home Assistant is unreachable at that moment, Claude is told to try again later and the connection is kept.
 
 **If it stops working for everyone.** Home Assistant's IP ban (`ip_ban_enabled`) is the one thing to watch: if it ever banned this server's address, every connection would end at its next refresh.
+
+**Switching a method off.** Taking a method out of `AUTH_METHODS` (or unchecking it in the add-on) ends its connections at their next refresh. If you also delete that method's settings, this server can no longer reach the upstream session to revoke it, so switch the method off first and delete its settings afterwards.
+
+The startup log says which methods are on: `auth homeassistant`, or `auth token` in token mode.
+
+### Upgrading the add-on from 0.4 to 0.5
+
+Version 0.5 needs no new settings, so the update starts as it is. It adds a **homeassistant** checkbox, on by default, which is the sign-in method you already use. The add-on's launcher now also checks `public_url` and `home_assistant_public_url`: if one is missing, it names the option in the log without printing any values.
 
 ### Upgrading the add-on from 0.3.x
 
@@ -215,7 +224,7 @@ In the Cloudflare dashboard, open the zone, then **Security → WAF → Custom r
 
 ## Security notes
 
-- This server holds an API key that can add records to your LubeLogger, so it refuses to start without either `MCP_AUTH_TOKEN`, a secret `MCP_PATH`, or an OAuth `AUTH_MODE`. Keep it LAN/VPN-only where you can.
+- This server holds an API key that can add records to your LubeLogger, so it refuses to start without either `MCP_AUTH_TOKEN`, a secret `MCP_PATH`, or an OAuth `AUTH_METHODS`. Keep it LAN/VPN-only where you can.
 - The confirm-before-write step is enforced as a two-call flow (propose, then commit with a token). That "the user said yes" is Claude's judgment, guided by the tool descriptions. The Claude app's own tool-approval prompt is a second gate if you leave it on for `commit_record`.
 - Costs and amounts are plain numbers in whatever currency and unit LubeLogger is configured for. No conversion happens.
 
