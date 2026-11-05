@@ -101,3 +101,8 @@ This replaces the approved design's three releases. Each step can be tested and 
   - switching a method off ending its connections;
   - a release 1 data file loading unchanged;
   - `launch.mjs` failing clearly, without printing values, for each missing setting.
+
+## Carried into step 2 (from step 1's final review)
+
+- **Revoke a switched-off method's upstream sessions when its settings are still present.** Step 1 only revokes through methods that are on. With a single method there was nothing to reach, since removing it returns the server to token mode. Step 2 adds a second method, so it has to build the switched-off method from its remaining settings for cleanup, as "Connections" above describes.
+- **Test that a `loginState` locked to one method refuses a second method.** This is listed under "Left to the builder". It could only be written once there were two real methods.
