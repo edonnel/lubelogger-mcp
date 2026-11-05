@@ -27,7 +27,7 @@ import {
   type LoginMethod,
   type RecheckResult,
 } from "./login-method.js";
-import { FailureLimiter, MAX_FAILURES, MAX_KEY_LENGTH, WINDOW_MS } from "./rate-limit.js";
+import { addressKey, FailureLimiter, MAX_FAILURES, MAX_KEY_LENGTH, WINDOW_MS } from "./rate-limit.js";
 import {
   BUTTON_LABEL,
   escapeHtml,
@@ -404,8 +404,10 @@ export class LoginProvider implements OAuthServerProvider {
 
     // the address always, and the username for the password form: either one being locked refuses the attempt
     // cut as the limiter cuts them, so the in-flight count and the limiter agree on what a key is
-    const keys = [`addr:${req.ip ?? "unknown"}`];
-    if (username) keys.push(`user:${username.toLowerCase()}`);
+    // an IPv6 address counts by its /64, and the username ignores case and surrounding spaces (for the key only)
+    const keys = [addressKey(req.ip)];
+    const userKey = username?.trim().toLowerCase();
+    if (userKey) keys.push(`user:${userKey}`);
     for (const [i, key] of keys.entries()) keys[i] = key.slice(0, MAX_KEY_LENGTH);
     const wait = this.limiter.lockedFor(keys);
     // attempts still being checked count too: otherwise a burst of posts all pass before any failure is recorded

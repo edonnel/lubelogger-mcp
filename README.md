@@ -290,7 +290,12 @@ On the sign-in screen the password form comes after any buttons for the other me
 
 **Passwords with a colon can't sign in.** LubeLogger's API checks a password through basic authentication, which cannot carry a `:` in the username or the password. A person whose password has one needs another method, or a new password.
 
-**Too many attempts.** 5 failed sign-ins within 15 minutes lock the address they came from for 15 minutes. On the password form the username is locked too, so spreading guesses over many addresses doesn't help. Attempts still being checked count as failures until they finish. Correct credentials for someone who is not on the allowlist don't count as failures, and are still refused. A locked-out person sees "Too many attempts" and can try again when the time is up.
+**Too many attempts.** 5 failed sign-ins within 15 minutes lock the address they came from for up to 15 minutes. An IPv6 address counts as its whole /64 network, since one client can use any address in it. On the password form the username is locked too, whichever address the guesses come from, so spreading guesses over many addresses or networks doesn't get more than 5 tries at one username. Attempts still being checked count as failures until they finish. Correct credentials for someone who is not on the allowlist don't count as failures, and are still refused. A locked-out person sees "Too many attempts" and can try again when the time is up.
+
+- **The address comes from the proxy in front.** The server trusts exactly one reverse proxy or tunnel in front of it (Express's `trust proxy 1`) and takes the client's address from the `X-Forwarded-For` header that proxy sets. Without a proxy in front, a client can choose its own address, and only the username lock is left.
+- **During a flood of failed attempts**, the server stops tracking new addresses and usernames once it holds as many as it can, and the two LubeLogger forms refuse sign-ins from any address or username it is not already tracking until the flood subsides. Home Assistant and OIDC sign-in keep working throughout.
+
+**Spell usernames the way LubeLogger does.** `LUBELOGGER_ALLOWED_USERS` is compared with the username LubeLogger reports, exactly, including case: write `alice` if LubeLogger knows her as `alice`, not `Alice`.
 
 **`LUBELOGGER_API_KEY` when only the key method is on.** With `lubelogger-key` as the only method, nobody uses the shared key, so `LUBELOGGER_API_KEY` may be left out. With any other method on, it is still required.
 

@@ -12,7 +12,7 @@ import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.
 import { WebSocketServer } from "ws";
 import { createApp } from "../dist/app.js";
 import { LoginProvider } from "../dist/auth/provider.js";
-import { FailureLimiter } from "../dist/auth/rate-limit.js";
+import { FailureLimiter, MAX_KEYS } from "../dist/auth/rate-limit.js";
 import { AuthStore, hashToken } from "../dist/auth/store.js";
 import { validateConfig } from "../dist/config.js";
 import { PendingStore } from "../dist/pending.js";
@@ -1313,6 +1313,40 @@ async function formTokens(client, opened, r) {
     clock += 15 * MINUTE;
     const fresh = await openApproval(claude, "alice");
     await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, ip));
+  });
+
+  await check("a username's failures count however it is spaced or cased", async () => {
+    clock += 15 * MINUTE;
+    const opened = await openApproval(claude, "alice");
+    const spellings = [" ALICE", "Alice ", "  alice  ", "aLiCe", "ALICE"];
+    for (const [i, name] of spellings.entries())
+      assert.equal((await passwordForm(opened, name, WRONG_PASSWORD, `198.51.100.${70 + i}`)).status, 400);
+    const checks = stubPassword.checks;
+    assert.equal((await passwordForm(opened, "alice", RIGHT_PASSWORD, "198.51.100.80")).status, 429);
+    assert.equal(stubPassword.checks, checks);
+    clock += 15 * MINUTE;
+  });
+
+  await check("while the limiter is full, a first password attempt from a new address is refused, and the buttons still work", async () => {
+    clock += 15 * MINUTE;
+    for (let i = 0; i < MAX_KEYS; i++) limiter.fail([`addr:flood-${i}`]);
+    try {
+      const opened = await openApproval(claude, "alice");
+      const checks = stubPassword.checks;
+      const r = await passwordForm(opened, "alice", RIGHT_PASSWORD, "203.0.113.50");
+      assert.equal(r.status, 429);
+      assert.match(errorOf(await r.text()) ?? "", /^Too many attempts\. Try again in \d+ minutes\.$/);
+      assert.equal(stubPassword.checks, checks, "LubeLogger is not asked");
+      // the Home Assistant button is not limited
+      const button = await approve(opened.loginState, opened.cookie);
+      assert.equal(button.status, 302, await button.text());
+      await formTokens(claude, opened, await callBack({ callback: button.headers.get("location"), cookie: opened.cookie }));
+    } finally {
+      // the flood's failures expire, which empties the limiter for the checks after this one
+      clock += 15 * MINUTE;
+    }
+    const fresh = await openApproval(claude, "alice");
+    await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, "203.0.113.50"));
   });
 
   await check("an API-key connection calls LubeLogger with its own key; others use the shared key", async () => {
