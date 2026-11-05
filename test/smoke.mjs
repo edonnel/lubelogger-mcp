@@ -1,8 +1,11 @@
 // End-to-end smoke test: real MCP server (dist/) + real MCP client + mock LubeLogger.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -152,7 +155,11 @@ async function tryStart(mockPort, endpointEnv) {
       const done = await Promise.race([exited, new Promise((r) => setTimeout(() => r(null), 100))]);
       if (done) return { started: false, code: done.code, log };
       try {
-        if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) return { started: true, log };
+        if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) {
+          // the startup line can trail the first answer on stderr
+          for (let j = 0; j < 20 && !log.includes("listening on"); j++) await new Promise((r) => setTimeout(r, 50));
+          return { started: true, log };
+        }
       } catch {}
     }
     throw new Error(`server neither started nor exited:\n${log}`);
@@ -564,6 +571,24 @@ async function main() {
     s = await tryStart(mockPort, { MCP_AUTH_TOKEN: AUTH_TOKEN });
     assert.ok(s.started, `refused a bearer token with the default path:\n${s.log}`);
     pass("starts with a bearer token and the default path");
+    assert.match(s.log, /listening on .*, auth token\n/);
+
+    // the startup line names the sign-in methods, so an OAuth server never reads as "auth token"
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "smoke-signin-"));
+    try {
+      s = await tryStart(mockPort, {
+        AUTH_METHODS: "homeassistant",
+        PUBLIC_URL: "https://mcp.example.com",
+        HOME_ASSISTANT_PUBLIC_URL: "https://ha.example.com",
+        HOME_ASSISTANT_URL: "http://ha.example.com:8123",
+        DATA_DIR: dataDir,
+      });
+    } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+    assert.ok(s.started, `refused AUTH_METHODS=homeassistant:\n${s.log}`);
+    assert.match(s.log, /listening on .*, auth homeassistant\n/);
+    pass("the startup log names the sign-in methods, or token when there are none");
 
     console.log(`\n${passed} checks passed`);
   } finally {

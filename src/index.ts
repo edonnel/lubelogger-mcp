@@ -14,7 +14,9 @@ try {
 const httpServer = built.app.listen(config.PORT, config.HOST, () => {
   // MCP_PATH can be the only credential (clients that cannot send a bearer token), so a custom one is never logged
   const endpoint = config.MCP_PATH === "/mcp" ? "/mcp" : "a custom MCP_PATH (not shown)";
-  console.error(`lubelogger-mcp listening on http://${config.HOST}:${config.PORT}, endpoint ${endpoint}, auth ${config.AUTH_MODE}`);
+  // the sign-in methods decide the mode, whichever of AUTH_MODE or AUTH_METHODS set them
+  const auth = config.AUTH_METHODS.length > 0 ? config.AUTH_METHODS.join(",") : "token";
+  console.error(`lubelogger-mcp listening on http://${config.HOST}:${config.PORT}, endpoint ${endpoint}, auth ${auth}`);
   console.error(`LubeLogger: ${config.LUBELOGGER_URL}`);
 });
 
