@@ -6,9 +6,11 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { HomeAssistantLogin } from "./auth/homeassistant.js";
-import type { LoginMethod } from "./auth/login-method.js";
+import type { AnyLoginMethod } from "./auth/login-method.js";
+import { LubeLoggerKeyLogin, LubeLoggerPasswordLogin } from "./auth/lubelogger-login.js";
 import { OidcLogin } from "./auth/oidc.js";
 import { LoginProvider } from "./auth/provider.js";
+import type { FailureLimiter } from "./auth/rate-limit.js";
 import { mountOAuth, plainErrorPage } from "./auth/routes.js";
 import { AuthStore } from "./auth/store.js";
 import type { Config, MethodName } from "./config.js";
@@ -37,26 +39,34 @@ const OAUTH_ENDPOINT = "/mcp";
 
 /**
  * `loginMethods` replaces the real implementation of any method it names, and `retiredMethods` that of any
- * switched-off method used for cleanup; tests inject stubs.
+ * switched-off method used for cleanup; tests inject stubs. `limiter` counts failed form sign-ins.
  */
 export type AppDeps = {
-  loginMethods?: Partial<Record<MethodName, LoginMethod>>;
-  retiredMethods?: Partial<Record<MethodName, LoginMethod>>;
+  loginMethods?: Partial<Record<MethodName, AnyLoginMethod>>;
+  retiredMethods?: Partial<Record<MethodName, AnyLoginMethod>>;
   now?: () => number;
+  limiter?: FailureLimiter;
 };
 
 export async function createApp(
   config: Config,
   deps: AppDeps = {},
 ): Promise<{ app: express.Express; close(): Promise<void> }> {
-  // absent when lubelogger-key is the only method on; Task 4 builds a client per connection
+  // the shared key's client; absent when lubelogger-key is the only method on
   const client = config.LUBELOGGER_API_KEY
     ? new LubeLoggerClient(config.LUBELOGGER_URL, config.LUBELOGGER_API_KEY, config.REQUEST_TIMEOUT_MS)
     : undefined;
   const pending = new PendingStore(config.CONFIRM_TTL_MINUTES * 60_000);
 
-  // the LubeLogger client a verified request works with; every connection uses the shared key for now
-  function clientFor(_auth?: AuthInfo): LubeLoggerClient {
+  /**
+   * The LubeLogger client a verified request works with: an API-key connection's own key, built for this request
+   * and never cached, and the shared key for every other connection.
+   */
+  function clientFor(auth?: AuthInfo): LubeLoggerClient {
+    const key = auth?.extra?.lubeloggerKey;
+    if (typeof key === "string" && key) return new LubeLoggerClient(config.LUBELOGGER_URL, key, config.REQUEST_TIMEOUT_MS);
+    // an API-key connection must never fall back to the shared key, which can see more than the person can
+    if (auth?.extra?.method === "lubelogger-key") throw new Error("this connection has no LubeLogger API key");
     if (!client) throw new Error("no shared LubeLogger API key is configured");
     return client;
   }
@@ -90,13 +100,13 @@ export async function createApp(
     if (!publicUrl) throw new Error("PUBLIC_URL is required when a sign-in method is on");
 
     // in AUTH_METHODS order, which is the order of the buttons on the sign-in screen
-    const methods = new Map<MethodName, LoginMethod>();
+    const methods = new Map<MethodName, AnyLoginMethod>();
     for (const name of config.AUTH_METHODS)
       methods.set(name, deps.loginMethods?.[name] ?? buildLoginMethod(name, config, publicUrl));
 
     // switched off but still configured: kept only to revoke the upstream sessions of their old connections
     const retired = buildRetiredMethods(config, publicUrl);
-    for (const [name, method] of Object.entries(deps.retiredMethods ?? {}) as [MethodName, LoginMethod][])
+    for (const [name, method] of Object.entries(deps.retiredMethods ?? {}) as [MethodName, AnyLoginMethod][])
       if (!methods.has(name)) retired.set(name, method);
 
     // HA fetches its client ID (PUBLIC_URL + "/") to show the app's name and find its redirect URI
@@ -114,6 +124,7 @@ export async function createApp(
       publicUrl,
       labels: { oidc: `Continue with ${config.OIDC_DISPLAY_NAME}` },
       retired,
+      limiter: deps.limiter,
     });
     // connections unused for 90 days go now and hourly after, not only when one is presented again
     await provider.startPurging();
@@ -124,7 +135,14 @@ export async function createApp(
 
   // Stateless Streamable HTTP: a fresh server + transport per request. Pending confirmations live in process memory, so they survive across requests.
   app.post(endpoint, guard, express.json({ limit: "1mb" }), async (req, res) => {
-    const server = createServer(clientFor(req.auth));
+    let server: McpServer;
+    try {
+      server = createServer(clientFor(req.auth));
+    } catch (err) {
+      console.error("MCP request failed:", err instanceof Error ? err.message : err);
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+      return;
+    }
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       void transport.close();
@@ -154,7 +172,7 @@ export async function createApp(
 }
 
 /** The real implementation of a sign-in method. Config has already refused any that is not available. */
-function buildLoginMethod(name: MethodName, config: Config, publicUrl: string): LoginMethod {
+function buildLoginMethod(name: MethodName, config: Config, publicUrl: string): AnyLoginMethod {
   if (name === "homeassistant") {
     if (!config.HOME_ASSISTANT_PUBLIC_URL || !config.HOME_ASSISTANT_URL)
       throw new Error("HOME_ASSISTANT_PUBLIC_URL and HOME_ASSISTANT_URL are required for the homeassistant sign-in method");
@@ -180,16 +198,23 @@ function buildLoginMethod(name: MethodName, config: Config, publicUrl: string): 
       authParams: config.OIDC_AUTH_PARAMS,
     });
   }
+  const lubelogger = { lubeloggerUrl: config.LUBELOGGER_URL, timeoutMs: config.REQUEST_TIMEOUT_MS };
+  if (name === "lubelogger-password")
+    return new LubeLoggerPasswordLogin({ ...lubelogger, allowedUsers: config.LUBELOGGER_ALLOWED_USERS });
+  if (name === "lubelogger-key") return new LubeLoggerKeyLogin(lubelogger);
   throw new Error(`sign-in method ${name} is not available in this version`);
 }
 
 /** A method for each sign-in method that is off but still configured, so old connections' sessions can be revoked. */
-function buildRetiredMethods(config: Config, publicUrl: string): Map<MethodName, LoginMethod> {
-  const configured: Partial<Record<MethodName, boolean>> = {
+function buildRetiredMethods(config: Config, publicUrl: string): Map<MethodName, AnyLoginMethod> {
+  // the LubeLogger methods need only LUBELOGGER_URL, which is always set
+  const configured: Record<MethodName, boolean> = {
     homeassistant: Boolean(config.HOME_ASSISTANT_URL && config.HOME_ASSISTANT_PUBLIC_URL),
     oidc: Boolean(config.OIDC_ISSUER && config.OIDC_CLIENT_ID),
+    "lubelogger-password": true,
+    "lubelogger-key": true,
   };
-  const retired = new Map<MethodName, LoginMethod>();
+  const retired = new Map<MethodName, AnyLoginMethod>();
   for (const [name, isConfigured] of Object.entries(configured) as [MethodName, boolean][])
     if (isConfigured && !config.AUTH_METHODS.includes(name)) retired.set(name, buildLoginMethod(name, config, publicUrl));
   return retired;

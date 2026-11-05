@@ -12,6 +12,7 @@ import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.
 import { WebSocketServer } from "ws";
 import { createApp } from "../dist/app.js";
 import { LoginProvider } from "../dist/auth/provider.js";
+import { FailureLimiter } from "../dist/auth/rate-limit.js";
 import { AuthStore, hashToken } from "../dist/auth/store.js";
 import { validateConfig } from "../dist/config.js";
 import { PendingStore } from "../dist/pending.js";
@@ -43,14 +44,20 @@ async function check(name, fn) {
 }
 
 // ---------- mock LubeLogger, enough for a propose and a commit ----------
+// a person's own API key, as a lubelogger-key connection carries it
+const PERSONAL_KEY = "key-alice";
 const writes = [];
+// the x-api-key header of every request, in order
+const seenKeys = [];
 const mock = http.createServer((req, res) => {
   const url = new URL(req.url, "http://mock");
   const send = (code, obj) => {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(JSON.stringify(obj));
   };
-  if (req.headers["x-api-key"] !== API_KEY) return send(401, { success: false, message: "Unauthorized" });
+  seenKeys.push(req.headers["x-api-key"]);
+  if (req.headers["x-api-key"] !== API_KEY && req.headers["x-api-key"] !== PERSONAL_KEY)
+    return send(401, { success: false, message: "Unauthorized" });
   if (req.method === "GET" && url.pathname === "/api/vehicles")
     return send(200, [{ id: 1, year: 2019, make: "Toyota", model: "Tacoma", licensePlate: "ABC123" }]);
   if (req.method === "GET" && url.pathname === "/api/vehicle/odometerrecords/latest") return send(200, 1000);
@@ -1005,6 +1012,335 @@ await check("with the identity provider down, the server still starts", async ()
 });
 
 await fs.rm(twoDir, { recursive: true, force: true });
+
+// ---------- the LubeLogger forms: all four methods on one server ----------
+// distinctive values, so the scan at the end finds any that leaked
+const RIGHT_PASSWORD = "PW-PLANTED-71";
+const WRONG_PASSWORD = "PW-PLANTED-WRONG-72";
+const WRONG_KEY = "KEY-PLANTED-WRONG-73";
+const WRONG_MESSAGE = "That username or password is wrong.";
+
+// alice with the right password signs in; any username starting "bob" with it is refused; anything else is wrong
+const stubPassword = {
+  form: "password",
+  checks: 0,
+  down: false,
+  async check(fields) {
+    this.checks++;
+    if (this.down) return { unavailable: "LubeLogger can't be reached right now. Try again shortly." };
+    if (fields.username === "alice" && fields.password === RIGHT_PASSWORD)
+      return { person: { id: "alice", name: "alice" }, upstream: { username: "alice" } };
+    if (fields.username?.startsWith("bob") && fields.password === RIGHT_PASSWORD)
+      return { refused: `${fields.username} is not allowed to use LubeLogger MCP.`, person: { id: fields.username, name: fields.username } };
+    return { invalid: WRONG_MESSAGE };
+  },
+  async recheck(upstream) {
+    return { ok: true, upstream, person: { id: upstream.username, name: upstream.username } };
+  },
+  async cleanup() {},
+};
+
+// alice's own key signs in as alice and the connection keeps the key
+const stubKey = {
+  form: "key",
+  checks: 0,
+  async check(fields) {
+    this.checks++;
+    if (fields.apiKey === PERSONAL_KEY)
+      return { person: { id: "alice", name: "alice" }, upstream: { username: "alice", apiKey: PERSONAL_KEY } };
+    return { invalid: "That API key is not valid." };
+  },
+  async recheck(upstream) {
+    return { ok: true, upstream, person: { id: upstream.username, name: upstream.username } };
+  },
+  async cleanup() {},
+};
+
+const formsDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-forms-"));
+const ALL_METHODS = "homeassistant,oidc,lubelogger-password,lubelogger-key";
+const formsConfig = (over = {}) =>
+  config({
+    AUTH_METHODS: ALL_METHODS,
+    AUTH_MODE: undefined,
+    ...OIDC_SETTINGS,
+    LUBELOGGER_ALLOWED_USERS: "alice",
+    DATA_DIR: formsDir,
+    ...over,
+  });
+const formStubs = { homeassistant: stub, oidc: stubOidc, "lubelogger-password": stubPassword, "lubelogger-key": stubKey };
+const limiter = new FailureLimiter(now);
+await startWith(formsConfig(), { loginMethods: formStubs, limiter, now });
+
+// a sign-in form posted from the browser that saw the screen, from address `ip`
+const postForm = (opened, fields, ip) =>
+  form("/login", { loginState: opened.loginState, ...fields }, { cookie: opened.cookie, "x-forwarded-for": ip });
+const passwordForm = (opened, username, password, ip = "198.51.100.1") =>
+  postForm(opened, { method: "lubelogger-password", username, password }, ip);
+const keyForm = (opened, apiKey, ip = "198.51.100.1") => postForm(opened, { method: "lubelogger-key", apiKey }, ip);
+
+// the text of the error box on a re-shown screen
+const errorOf = (html) => html.match(/<div class="box error" role="alert"><p>([^<]*)<\/p><\/div>/)?.[1];
+
+// every <input> tag whose name is `name`
+const inputsNamed = (html, name) => [...html.matchAll(/<input\b[^>]*>/g)].map((m) => m[0]).filter((t) => t.includes(`name="${name}"`));
+
+// the code a successful form sign-in sent back to Claude, checked like authorizeAs checks the callback's
+function codeFrom(r) {
+  assert.equal(r.status, 302);
+  const back = new URL(r.headers.get("location"));
+  assert.equal(`${back.origin}${back.pathname}`, REDIRECT_URI);
+  assert.equal(back.searchParams.get("state"), "claude-state-123");
+  const code = back.searchParams.get("code");
+  assert.ok(code);
+  secrets.add(code);
+  return code;
+}
+
+async function formTokens(client, opened, r) {
+  const t = await exchange(client, codeFrom(r), opened.verifier);
+  assert.equal(t.status, 200, await t.clone().text());
+  return remember(await t.json());
+}
+
+{
+  const claude = await register();
+
+  await check("the screen shows buttons, then 'or', then the password form, then the key form behind 'Use a LubeLogger API key instead'", async () => {
+    const { html } = await openApproval(claude, "alice");
+    const markers = [
+      'value="homeassistant"',
+      'value="oidc"',
+      'class="or"',
+      'name="username"',
+      'name="password"',
+      "<details>",
+      "<summary>Use a LubeLogger API key instead</summary>",
+      'name="apiKey"',
+    ];
+    const at = markers.map((m) => html.indexOf(m));
+    for (const [i, m] of markers.entries()) assert.ok(at[i] >= 0, `${m} is on the screen`);
+    assert.deepEqual([...at].sort((a, b) => a - b), at, "in that order");
+
+    assert.match(html, /autocomplete="current-password"/);
+    assert.match(html, /autocomplete="username"/);
+    const [password] = inputsNamed(html, "password");
+    const [apiKey] = inputsNamed(html, "apiKey");
+    assert.match(password, /type="password"/);
+    assert.match(apiKey, /autocomplete="off"/);
+    for (const tag of [password, apiKey]) assert.doesNotMatch(tag, /value=/);
+    // each form posts the one-time state and its own method
+    assert.equal(inputsNamed(html, "loginState").length, 3);
+    assert.ok(html.includes('<input type="hidden" name="method" value="lubelogger-password">'));
+    assert.ok(html.includes('<input type="hidden" name="method" value="lubelogger-key">'));
+    assert.doesNotMatch(html, /<script/i);
+  });
+
+  await check("a right password signs in and the code exchanges for tokens", async () => {
+    const opened = await openApproval(claude, "alice");
+    const r = await passwordForm(opened, "alice", RIGHT_PASSWORD, "198.51.100.2");
+    const cleared = r.headers.getSetCookie().find((c) => c.startsWith("lm_login="));
+    assert.match(cleared ?? "", /Max-Age=0/, "the login cookie is cleared");
+    const tokens = await formTokens(claude, opened, r);
+    const mcp = await mcpClient(tokens.access_token);
+    assert.equal((await mcp.listTools()).tools.length, 12);
+    await mcp.close();
+    assert.ok(logs.some((l) => l.includes('login by "alice"')));
+  });
+
+  await check("a wrong password re-shows the screen with the error and the username, clears the secrets, and keeps the state usable", async () => {
+    const opened = await openApproval(claude, "alice");
+    const mark = logs.length;
+    const wrong = await passwordForm(opened, "alice", WRONG_PASSWORD, "198.51.100.3");
+    assert.equal(wrong.status, 400);
+    const html = await wrong.text();
+    assert.equal(errorOf(html), WRONG_MESSAGE);
+    assert.ok(html.includes('value="alice"'), "the username is kept");
+    assert.ok(!html.includes(WRONG_PASSWORD), "the typed password is not on the page");
+    assert.doesNotMatch(inputsNamed(html, "password")[0], /value=/);
+    // the error sits above the password form, and the screen still carries the same state
+    assert.ok(html.indexOf('class="box error"') < html.indexOf('name="password"'));
+    assert.ok(html.indexOf('class="box error"') > html.indexOf('class="or"'));
+    assert.equal(loginStateOf(html), opened.loginState);
+    assert.ok(logs.slice(mark).some((l) => l.includes('sign-in failed for "alice"')));
+
+    const right = await passwordForm(opened, "alice", RIGHT_PASSWORD, "198.51.100.3");
+    await formTokens(claude, opened, right);
+    // a sign-in that succeeded locks the state: it is used up
+    const after = await approve(opened.loginState, opened.cookie);
+    assert.equal(after.status, 400);
+    assert.match(await after.text(), /Login expired/);
+  });
+
+  await check("a wrong key re-shows the screen with the key form open, its error, and no key", async () => {
+    const opened = await openApproval(claude, "alice");
+    const mark = logs.length;
+    const r = await keyForm(opened, WRONG_KEY, "198.51.100.4");
+    assert.equal(r.status, 400);
+    const html = await r.text();
+    assert.equal(errorOf(html), "That API key is not valid.");
+    assert.ok(!html.includes(WRONG_KEY));
+    assert.match(html, /<details open>/);
+    assert.ok(html.indexOf('class="box error"') > html.indexOf("<details open>"));
+    assert.ok(html.indexOf('class="box error"') < html.indexOf('name="apiKey"'));
+    assert.ok(logs.slice(mark).some((l) => l.includes("sign-in failed with an API key")));
+  });
+
+  await check("a wrong password, then a Home Assistant button press, on the same state works", async () => {
+    const opened = await openApproval(claude, "alice");
+    const wrong = await passwordForm(opened, "carol", WRONG_PASSWORD, "198.51.100.5");
+    assert.equal(wrong.status, 400);
+    const r = await approve(opened.loginState, opened.cookie);
+    assert.equal(r.status, 302, await r.text());
+    const back = await callBack({ callback: r.headers.get("location"), cookie: opened.cookie });
+    await formTokens(claude, opened, back);
+  });
+
+  await check("a refused person gets the Not allowed page and the state is used up", async () => {
+    const opened = await openApproval(claude, "alice");
+    const mark = logs.length;
+    const name = "bob<i>&";
+    const r = await passwordForm(opened, name, RIGHT_PASSWORD, "198.51.100.6");
+    assert.equal(r.status, 403);
+    const html = await r.text();
+    assert.match(html, /<h1>Not allowed<\/h1>/);
+    assert.ok(html.includes("bob&lt;i&gt;&amp; is not allowed"), "the refusal is escaped");
+    assert.ok(!html.includes("<i>"));
+    assert.match(r.headers.getSetCookie().find((c) => c.startsWith("lm_login=")) ?? "", /Max-Age=0/);
+    const since = logs.slice(mark);
+    assert.ok(since.some((l) => l.includes(`sign-in refused for ${JSON.stringify(name)}`)));
+    assert.ok(!since.some((l) => l.includes("is not allowed to use")), "the refusal message is not logged");
+
+    const again = await passwordForm(opened, "alice", RIGHT_PASSWORD, "198.51.100.6");
+    assert.equal(again.status, 400);
+    assert.match(await again.text(), /Login expired/);
+  });
+
+  await check("LubeLogger unreachable shows 'try again shortly' and keeps the state", async () => {
+    const opened = await openApproval(claude, "alice");
+    stubPassword.down = true;
+    try {
+      // five in a row from one address: none counts as a failure, so the sixth try is not locked out
+      for (let i = 0; i < 5; i++) {
+        const r = await passwordForm(opened, "alice", RIGHT_PASSWORD, "198.51.100.7");
+        assert.equal(r.status, 503);
+        const html = await r.text();
+        assert.match(errorOf(html) ?? "", /try again shortly/i);
+        assert.ok(html.includes('value="alice"'));
+      }
+    } finally {
+      stubPassword.down = false;
+    }
+    await formTokens(claude, opened, await passwordForm(opened, "alice", RIGHT_PASSWORD, "198.51.100.7"));
+  });
+
+  await check("the sixth failure in 15 minutes is refused without calling the method, for one address and many usernames, and for one username from many addresses", async () => {
+    // earlier checks' failures age out first
+    clock += 15 * MINUTE;
+    const opened = await openApproval(claude, "alice");
+    const byAddress = "198.51.100.20";
+    // one address, five usernames
+    for (let i = 1; i <= 5; i++) assert.equal((await passwordForm(opened, `user${i}`, WRONG_PASSWORD, byAddress)).status, 400);
+    // one real username, five addresses
+    for (let i = 1; i <= 5; i++) assert.equal((await passwordForm(opened, "alice", WRONG_PASSWORD, `198.51.100.${30 + i}`)).status, 400);
+
+    const checks = stubPassword.checks;
+    // the right password, for the locked username from a fresh address
+    const byUser = await passwordForm(opened, "alice", RIGHT_PASSWORD, "198.51.100.40");
+    assert.equal(byUser.status, 429);
+    const userError = errorOf(await byUser.text());
+    // an unknown username from the locked address
+    const unknown = await passwordForm(opened, "nobody-here", RIGHT_PASSWORD, byAddress);
+    assert.equal(unknown.status, 429);
+    const addressError = errorOf(await unknown.text());
+    assert.equal(userError, "Too many attempts. Try again in 15 minutes.");
+    assert.equal(addressError, userError, "a real and an unknown username read the same");
+    // the key form is locked by address too
+    const keyChecks = stubKey.checks;
+    assert.equal((await keyForm(opened, PERSONAL_KEY, byAddress)).status, 429);
+    assert.equal(stubKey.checks, keyChecks);
+
+    // a minute later: rounded up, and refusals during the lockout are not themselves counted (five of them here
+    // would otherwise keep both locked past the 15 minutes below)
+    clock += MINUTE;
+    for (let i = 0; i < 5; i++) {
+      const later = await passwordForm(opened, "alice", RIGHT_PASSWORD, byAddress);
+      assert.equal(later.status, 429);
+      assert.equal(errorOf(await later.text()), "Too many attempts. Try again in 14 minutes.");
+    }
+    assert.equal(stubPassword.checks, checks, "LubeLogger is never asked during a lockout");
+
+    // 15 minutes after the failures, both are free again (the old state has expired, so a new one)
+    clock += 14 * MINUTE;
+    const fresh = await openApproval(claude, "alice");
+    await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, byAddress));
+    assert.equal(stubPassword.checks, checks + 1);
+  });
+
+  await check("an API-key connection calls LubeLogger with its own key; others use the shared key", async () => {
+    const opened = await openApproval(claude, "alice");
+    const viaKey = await formTokens(claude, opened, await keyForm(opened, PERSONAL_KEY, "198.51.100.50"));
+
+    const callAs = async (accessToken) => {
+      const from = seenKeys.length;
+      const mcp = await mcpClient(accessToken);
+      const r = await mcp.callTool({ name: "list_vehicles", arguments: {} });
+      await mcp.close();
+      assert.ok(!r.isError, text(r));
+      assert.match(text(r), /Tacoma/);
+      const used = seenKeys.slice(from);
+      assert.ok(used.length > 0);
+      return [...new Set(used)];
+    };
+
+    assert.deepEqual(await callAs(viaKey.access_token), [PERSONAL_KEY]);
+    // still its own key after a refresh
+    const r = await refresh(claude, viaKey.refresh_token);
+    assert.equal(r.status, 200);
+    const refreshed = remember(await r.json());
+    assert.deepEqual(await callAs(refreshed.access_token), [PERSONAL_KEY]);
+
+    const viaHa = await login(claude, "alice", beginWith("homeassistant"));
+    assert.deepEqual(await callAs(viaHa.access_token), [API_KEY]);
+  });
+
+  await stop();
+}
+
+await check("with the password method off, the key form is open and has no 'instead' summary", async () => {
+  const offDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-keyonly-"));
+  try {
+    await startWith(config({ AUTH_METHODS: "homeassistant,lubelogger-key", AUTH_MODE: undefined, DATA_DIR: offDir }), {
+      loginMethods: { homeassistant: stub, "lubelogger-key": stubKey },
+      now,
+    });
+    const { html } = await openApproval(await register(), "alice");
+    assert.ok(!html.includes("instead"));
+    assert.doesNotMatch(html, /<summary>/);
+    assert.doesNotMatch(html, /name="password"/);
+    assert.match(html, /name="apiKey"/);
+    // the key form is not hidden behind a closed <details>
+    assert.ok(!/<details>/.test(html));
+    assert.ok(html.indexOf('class="or"') < html.indexOf('name="apiKey"'));
+    await stop();
+  } finally {
+    if (running) await stop();
+    await fs.rm(offDir, { recursive: true, force: true });
+  }
+});
+
+await check("no typed password or key reaches a log or the data file", async () => {
+  const all = logs.join("\n");
+  const raw = await fs.readFile(path.join(formsDir, "oauth.json"), "utf8");
+  for (const planted of [RIGHT_PASSWORD, WRONG_PASSWORD, WRONG_KEY]) {
+    assert.ok(!all.includes(planted), `${planted} is not in a log`);
+    assert.ok(!raw.includes(planted), `${planted} is not in the data file`);
+  }
+  // the design stores a person's own key with the connection, but never logs it
+  assert.ok(raw.includes(PERSONAL_KEY));
+  assert.ok(!all.includes(PERSONAL_KEY), "the API key is not in a log");
+});
+
+await fs.rm(formsDir, { recursive: true, force: true });
 
 // ---------- Home Assistant: the real login method against a mock HA ----------
 // The mock speaks HA's OAuth endpoints and the WebSocket auth handshake plus auth/current_user.

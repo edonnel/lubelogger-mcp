@@ -1,5 +1,6 @@
-// The sign-in screen /authorize shows: the requesting app, where it returns, and one button per sign-in method.
-// Pressing a button is the approval. The page needs no JavaScript and is never framed.
+// The sign-in screen /authorize shows: the requesting app, where it returns, a button per redirect method and a form
+// per LubeLogger method. Pressing a button, or a form check that succeeds, is the approval.
+// The page needs no JavaScript and is never framed.
 import type { MethodName } from "../config.js";
 
 /** The headers of every page the sign-in flow shows. */
@@ -50,7 +51,17 @@ const STYLE =
   "font-weight:500;cursor:pointer}" +
   "button:hover{background:var(--btn-hover)}" +
   "button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}" +
-  "button svg{flex:none}";
+  "button svg{flex:none}" +
+  ".or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:.86rem}" +
+  ".or::before,.or::after{content:\"\";flex:1;border-top:1px solid var(--line)}" +
+  "label{display:grid;gap:4px;text-align:left;font-size:.86rem;color:var(--muted)}" +
+  "input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--card);" +
+  "color:var(--ink);font:inherit}" +
+  "input:focus-visible{outline:2px solid var(--focus);outline-offset:1px}" +
+  "details{display:grid;gap:10px;text-align:left}" +
+  "details[open]>summary{margin-bottom:10px}" +
+  "summary{cursor:pointer;color:var(--muted);font-size:.86rem;text-align:center}" +
+  ".error{border-color:#c0392b;color:var(--ink)}";
 
 // a wrench: the server's mark at the top of every page
 const LOGO =
@@ -80,28 +91,87 @@ export function pageShell(title: string, body: string): string {
   );
 }
 
-/** The whole sign-in screen. Every interpolated value is escaped. */
+/** The sign-in forms, by the kind of credentials they take. */
+export type FormKind = "password" | "key";
+
+/** The method each form posts. */
+const FORM_METHOD: Record<FormKind, MethodName> = { password: "lubelogger-password", key: "lubelogger-key" };
+
+/** An error box, shown above the form it belongs to. */
+function errorBox(message: string): string {
+  return `<div class="box error" role="alert"><p>${escapeHtml(message)}</p></div>`;
+}
+
+/** A form's opening tag and the hidden fields every form posts: the one-time state and the method. */
+function formStart(loginState: string, kind: FormKind): string {
+  return (
+    "<form method=\"post\" action=\"/login\">" +
+    `<input type="hidden" name="loginState" value="${escapeHtml(loginState)}">` +
+    `<input type="hidden" name="method" value="${escapeHtml(FORM_METHOD[kind])}">`
+  );
+}
+
+/**
+ * The whole sign-in screen: the redirect methods' buttons, then the LubeLogger forms. After a failed attempt it is
+ * shown again with `error` above the form that failed and `username` kept. A typed password or key is never put
+ * back on the page. Every interpolated value is escaped.
+ */
 export function signInPage(opts: {
   appName: string;
   returnHost: string;
   loginState: string;
   choices: MethodChoice[];
+  forms?: { password?: boolean; key?: boolean };
+  error?: { form: FormKind; message: string };
+  username?: string;
 }): string {
-  const buttons = opts.choices
-    .map(
-      (c) =>
-        `<button type="submit" name="method" value="${escapeHtml(c.method)}">` +
-        `${METHOD_ICON[c.method] ?? ""}${escapeHtml(c.label)}</button>`,
-    )
-    .join("");
+  const errorFor = (kind: FormKind) => (opts.error?.form === kind ? errorBox(opts.error.message) : "");
+  const state = `<input type="hidden" name="loginState" value="${escapeHtml(opts.loginState)}">`;
+
+  const buttons = opts.choices.length
+    ? "<form method=\"post\" action=\"/login\">" +
+      state +
+      opts.choices
+        .map(
+          (c) =>
+            `<button type="submit" name="method" value="${escapeHtml(c.method)}">` +
+            `${METHOD_ICON[c.method] ?? ""}${escapeHtml(c.label)}</button>`,
+        )
+        .join("") +
+      "</form>"
+    : "";
+
+  const password = opts.forms?.password
+    ? errorFor("password") +
+      formStart(opts.loginState, "password") +
+      "<label>Username<input type=\"text\" name=\"username\" autocomplete=\"username\" " +
+      `autocapitalize="none" spellcheck="false" required${opts.username ? ` value="${escapeHtml(opts.username)}"` : ""}></label>` +
+      "<label>Password<input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label>" +
+      `<button type="submit">${escapeHtml(BUTTON_LABEL["lubelogger-password"])}</button></form>`
+    : "";
+
+  const keyForm =
+    errorFor("key") +
+    formStart(opts.loginState, "key") +
+    "<label>LubeLogger API key<input type=\"password\" name=\"apiKey\" autocomplete=\"off\" required></label>" +
+    `<button type="submit">${escapeHtml(BUTTON_LABEL["lubelogger-key"])}</button></form>`;
+  // behind a closed "instead" toggle next to the password form, opened by its own error; on its own otherwise
+  const key = !opts.forms?.key
+    ? ""
+    : password
+      ? `<details${opts.error?.form === "key" ? " open" : ""}><summary>Use a LubeLogger API key instead</summary>${keyForm}</details>`
+      : keyForm;
+
+  const divider = buttons && (password || key) ? "<div class=\"or\">or</div>" : "";
 
   return pageShell(
     "Sign in to LubeLogger MCP",
     "<div class=\"box\"><p>" +
       `<strong>${escapeHtml(opts.appName)}</strong> wants access to your vehicle records and will return to ` +
       `<strong>${escapeHtml(opts.returnHost)}</strong>. Only continue if you started this from Claude.</p></div>` +
-      "<form method=\"post\" action=\"/login\">" +
-      `<input type="hidden" name="loginState" value="${escapeHtml(opts.loginState)}">` +
-      `${buttons}</form>`,
+      buttons +
+      divider +
+      password +
+      key,
   );
 }

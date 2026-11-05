@@ -18,8 +18,25 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { MethodName } from "../config.js";
-import type { LoginMethod, RecheckResult } from "./login-method.js";
-import { BUTTON_LABEL, escapeHtml, PAGE_HEADERS, pageShell, signInPage } from "./signin-page.js";
+import {
+  isFormMethod,
+  type AnyLoginMethod,
+  type FormCheckResult,
+  type FormFields,
+  type FormLoginMethod,
+  type LoginMethod,
+  type RecheckResult,
+} from "./login-method.js";
+import { FailureLimiter } from "./rate-limit.js";
+import {
+  BUTTON_LABEL,
+  escapeHtml,
+  PAGE_HEADERS,
+  pageShell,
+  signInPage,
+  type FormKind,
+  type MethodChoice,
+} from "./signin-page.js";
 import { hashToken, REFRESH_GRACE_MS, type AuthStore, type Connection, type Person } from "./store.js";
 
 export const ACCESS_TOKEN_TTL_MS = 60 * 60_000;
@@ -38,19 +55,27 @@ const EXPIRED_UNUSED = "expired after 90 days unused";
 
 const METHOD_OFF = "sign-in method switched off";
 
+/** The longest username, password or key read from a sign-in form; anything longer is cut, never sent whole. */
+const MAX_FIELD_LENGTH = 512;
+
+/** The method whose connections act with the person's own LubeLogger API key. */
+const KEY_METHOD: MethodName = "lubelogger-key";
+
 export const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com"];
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
 // method: the one the person chose on the sign-in screen. Only then is a login method's answer accepted, and only
 // that method's. browserHash: the SHA-256 of the nonce in the sign-in screen's cookie, which choosing and callback
-// must present.
+// must present. appName and returnHost: what the screen named, kept so it can be shown again after a failed form.
 type LoginState = {
   clientId: string;
   params: AuthorizationParams;
   createdAt: number;
   method?: MethodName;
   browserHash: string;
+  appName: string;
+  returnHost: string;
 };
 
 type PendingCode = {
@@ -62,7 +87,15 @@ type PendingCode = {
   createdAt: number;
 };
 
-type AccessGrant = { connectionId: string; clientId: string; method: MethodName; person: Person; expiresAt: number };
+// lubeloggerKey: the person's own LubeLogger API key, for lubelogger-key connections only
+type AccessGrant = {
+  connectionId: string;
+  clientId: string;
+  method: MethodName;
+  person: Person;
+  expiresAt: number;
+  lubeloggerKey?: string;
+};
 
 // the pair a rotation issued, kept so a retry with the previous refresh token gets the same answer
 type RecentRotation = { refreshHash: string; tokens: OAuthTokens; rotatedAt: number };
@@ -148,7 +181,10 @@ export class LoginProvider implements OAuthServerProvider {
   private readonly labels: Partial<Record<MethodName, string>>;
 
   // switched off but still configured: used only to revoke old connections' upstream sessions
-  private readonly retired: ReadonlyMap<MethodName, LoginMethod>;
+  private readonly retired: ReadonlyMap<MethodName, AnyLoginMethod>;
+
+  // failed form sign-ins, by address and by username
+  private readonly limiter: FailureLimiter;
 
   private lastPurge: number;
 
@@ -158,19 +194,21 @@ export class LoginProvider implements OAuthServerProvider {
 
   constructor(
     private readonly store: AuthStore,
-    private readonly methods: ReadonlyMap<MethodName, LoginMethod>,
+    private readonly methods: ReadonlyMap<MethodName, AnyLoginMethod>,
     private readonly now: () => number = Date.now,
     opts: {
       allowedRedirectHosts?: readonly string[];
       publicUrl?: string;
       labels?: Partial<Record<MethodName, string>>;
-      retired?: ReadonlyMap<MethodName, LoginMethod>;
+      retired?: ReadonlyMap<MethodName, AnyLoginMethod>;
+      limiter?: FailureLimiter;
     } = {},
   ) {
     if (methods.size === 0) throw new Error("at least one sign-in method is required");
     this.allowedRedirectHosts = opts.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS;
     this.labels = opts.labels ?? {};
     this.retired = opts.retired ?? new Map();
+    this.limiter = opts.limiter ?? new FailureLimiter(now);
     this.publicOrigin = opts.publicUrl ? new URL(opts.publicUrl).origin : undefined;
     this.lastPurge = this.now();
     this.clientsStore = {
@@ -200,28 +238,56 @@ export class LoginProvider implements OAuthServerProvider {
 
     const loginState = newSecret();
     const nonce = newSecret();
-    this.states.set(loginState, {
+    const entry: LoginState = {
       clientId: client.client_id,
       params,
       createdAt: this.now(),
       browserHash: hashToken(nonce),
-    });
+      appName: client.client_name?.trim() ? client.client_name.trim() : "An unnamed app",
+      returnHost: host,
+    };
+    this.states.set(loginState, entry);
     res.append(
       "Set-Cookie",
       `${LOGIN_COOKIE}=${nonce}; ${COOKIE_ATTRIBUTES}; Max-Age=${Math.floor(LOGIN_STATE_TTL_MS / 1000)}`,
     );
-
-    const name = client.client_name?.trim() ? client.client_name.trim() : "An unnamed app";
-    // one button per method, in the order the methods were configured
-    const choices = [...this.methods.keys()].map((method) => ({ method, label: this.labels[method] ?? BUTTON_LABEL[method] }));
-    res
-      .status(200)
-      .set(PAGE_HEADERS)
-      .type("html")
-      .send(signInPage({ appName: name, returnHost: host, loginState, choices }));
+    this.showScreen(res, 200, loginState, entry);
   }
 
-  /** POST /login: the person pressed a method's button on the screen `authorize` showed. Never throws. */
+  /** The sign-in screen for `entry`, or the same screen again after a failed form, with its error and username. */
+  private showScreen(
+    res: express.Response,
+    status: number,
+    loginState: string,
+    entry: LoginState,
+    failed?: { form: FormKind; message: string; username?: string },
+  ): void {
+    // a button per redirect method and a form per form method, in the order the methods were configured
+    const choices: MethodChoice[] = [];
+    const forms: { password?: boolean; key?: boolean } = {};
+    for (const [method, login] of this.methods) {
+      if (isFormMethod(login)) forms[login.form] = true;
+      else choices.push({ method, label: this.labels[method] ?? BUTTON_LABEL[method] });
+    }
+    const error = failed ? { form: failed.form, message: failed.message } : undefined;
+    res
+      .status(status)
+      .set(PAGE_HEADERS)
+      .type("html")
+      .send(
+        signInPage({
+          appName: entry.appName,
+          returnHost: entry.returnHost,
+          loginState,
+          choices,
+          forms,
+          error,
+          username: failed?.username,
+        }),
+      );
+  }
+
+  /** POST /login: the person pressed a method's button, or sent a form, on the screen `authorize` showed. Never throws. */
   async handleChoose(req: express.Request, res: express.Response): Promise<void> {
     try {
       this.sweep();
@@ -251,6 +317,10 @@ export class LoginProvider implements OAuthServerProvider {
         page(res, 400, "Not available", "That sign-in method is not available on this server.");
         return;
       }
+      if (isFormMethod(method)) {
+        await this.checkForm(req, res, loginState, entry, value as MethodName, method);
+        return;
+      }
       entry.method = value as MethodName;
       await method.start(loginState, res);
     } catch (err) {
@@ -269,7 +339,8 @@ export class LoginProvider implements OAuthServerProvider {
       if (entry) this.states.delete(loginState);
       clearLoginCookie(res);
       // only through the method chosen on the sign-in screen
-      const method = entry?.method !== undefined ? this.methods.get(entry.method) : undefined;
+      const chosen = entry?.method !== undefined ? this.methods.get(entry.method) : undefined;
+      const method = chosen && !isFormMethod(chosen) ? chosen : undefined;
       if (
         !entry ||
         entry.method === undefined ||
@@ -296,25 +367,116 @@ export class LoginProvider implements OAuthServerProvider {
         return;
       }
 
-      const code = newSecret();
-      this.codes.set(hashToken(code), {
-        clientId: entry.clientId,
-        params: entry.params,
-        method: entry.method,
-        person: result.person,
-        upstream: result.upstream,
-        createdAt: this.now(),
-      });
-      log(`login by ${who(result.person)}`);
-
-      const target = new URL(entry.params.redirectUri);
-      target.searchParams.set("code", code);
-      if (entry.params.state !== undefined) target.searchParams.set("state", entry.params.state);
-      res.set("Cache-Control", "no-store").redirect(302, target.href);
+      this.completeLogin(res, entry, entry.method, result.person, result.upstream);
     } catch (err) {
       log(`login callback failed: ${err instanceof Error ? err.message : "unknown error"}`);
       if (!res.headersSent) page(res, 500, "Login failed", "Something went wrong. Start again from Claude.");
     }
+  }
+
+  /**
+   * A LubeLogger form sent from the sign-in screen; the state, Origin, cookie and method checks have already passed.
+   * A wrong password or key, a lockout, or LubeLogger being unreachable shows the screen again and leaves the state
+   * unlocked, so the person can retry or choose another method. Success, or a refusal, uses the state up.
+   */
+  private async checkForm(
+    req: express.Request,
+    res: express.Response,
+    loginState: string,
+    entry: LoginState,
+    name: MethodName,
+    method: FormLoginMethod,
+  ): Promise<void> {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const field = (key: string) => {
+      const value = body[key];
+      return typeof value === "string" ? value.slice(0, MAX_FIELD_LENGTH) : "";
+    };
+    // each form fills only its own fields; the username is the only one ever shown again
+    const username = method.form === "password" ? field("username") : undefined;
+    const fields: FormFields =
+      method.form === "password" ? { username, password: field("password") } : { apiKey: field("apiKey") };
+    const showAgain = (status: number, message: string) =>
+      this.showScreen(res, status, loginState, entry, { form: method.form, message, username });
+
+    // the address always, and the username for the password form: either one being locked refuses the attempt
+    const keys = [`addr:${req.ip ?? "unknown"}`];
+    if (username) keys.push(`user:${username.toLowerCase()}`);
+    const wait = this.limiter.lockedFor(keys);
+    if (wait > 0) {
+      // nothing is sent to LubeLogger, and this refusal is not itself counted as a failure
+      log("sign-in refused: too many failed attempts");
+      showAgain(429, `Too many attempts. Try again in ${Math.ceil(wait / 60_000)} minutes.`);
+      return;
+    }
+
+    let result: FormCheckResult;
+    try {
+      result = await method.check(fields);
+    } catch {
+      // the error is left out of the log: it could carry what was typed
+      log("sign-in check failed");
+      showAgain(503, "The sign-in could not be checked. Try again shortly.");
+      return;
+    }
+
+    if ("invalid" in result) {
+      this.limiter.fail(keys);
+      log(username === undefined ? "sign-in failed with an API key" : `sign-in failed for ${JSON.stringify(username.slice(0, 60))}`);
+      showAgain(400, result.invalid);
+      return;
+    }
+    if ("unavailable" in result) {
+      log("sign-in check could not reach LubeLogger");
+      showAgain(503, result.unavailable);
+      return;
+    }
+
+    // another method, or another post of this form, may have used the state while LubeLogger was asked
+    if (this.states.get(loginState) !== entry || entry.method !== undefined) {
+      if ("upstream" in result) await this.safeCleanup(result.upstream, result.person, name);
+      page(res, 400, "Login expired", EXPIRED_LINK);
+      return;
+    }
+    this.states.delete(loginState);
+    clearLoginCookie(res);
+
+    if ("refused" in result) {
+      // the message can hold a username LubeLogger supplied: shown escaped, and never logged as it is
+      log(`sign-in refused for ${JSON.stringify((result.person?.name ?? username ?? "unknown").slice(0, 60))}`);
+      page(res, 403, "Not allowed", result.refused);
+      return;
+    }
+    entry.method = name;
+    this.completeLogin(res, entry, name, result.person, result.upstream);
+  }
+
+  /**
+   * The end of every successful login, once its state and cookie are gone: stores a one-time code for `person` and
+   * sends the browser back to Claude with it.
+   */
+  private completeLogin(
+    res: express.Response,
+    entry: LoginState,
+    method: MethodName,
+    person: Person,
+    upstream: Record<string, unknown>,
+  ): void {
+    const code = newSecret();
+    this.codes.set(hashToken(code), {
+      clientId: entry.clientId,
+      params: entry.params,
+      method,
+      person,
+      upstream,
+      createdAt: this.now(),
+    });
+    log(`login by ${who(person)}`);
+
+    const target = new URL(entry.params.redirectUri);
+    target.searchParams.set("code", code);
+    if (entry.params.state !== undefined) target.searchParams.set("state", entry.params.state);
+    res.set("Cache-Control", "no-store").redirect(302, target.href);
   }
 
   async challengeForAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<string> {
@@ -447,7 +609,12 @@ export class LoginProvider implements OAuthServerProvider {
       clientId: grant.clientId,
       scopes: [],
       expiresAt: Math.floor(grant.expiresAt / 1000),
-      extra: { method: grant.method, personId: grant.person.id, personName: grant.person.name },
+      extra: {
+        method: grant.method,
+        personId: grant.person.id,
+        personName: grant.person.name,
+        ...(grant.lubeloggerKey !== undefined ? { lubeloggerKey: grant.lubeloggerKey } : {}),
+      },
     };
   }
 
@@ -517,12 +684,15 @@ export class LoginProvider implements OAuthServerProvider {
 
   private issue(connection: Connection, refreshToken: string): OAuthTokens {
     const accessToken = newSecret();
+    // only an API-key connection has a key of its own; every other one acts with the shared key
+    const apiKey = connection.upstream.apiKey;
     this.access.set(hashToken(accessToken), {
       connectionId: connection.id,
       clientId: connection.clientId,
       method: connection.method,
       person: connection.person,
       expiresAt: this.now() + ACCESS_TOKEN_TTL_MS,
+      ...(connection.method === KEY_METHOD && typeof apiKey === "string" && apiKey ? { lubeloggerKey: apiKey } : {}),
     });
     return {
       access_token: accessToken,
