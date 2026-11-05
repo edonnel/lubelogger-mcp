@@ -6,9 +6,25 @@ import { fileURLToPath } from "node:url";
 
 const STATE_DIR = "/data/oauth";
 
-/** The sign-in methods that are switched on. Each checkbox is on unless its option is exactly false, so 0.4 options keep working. */
+/** True for an option that holds text. */
+function is_set(value) {
+	return typeof value === "string" && value !== "";
+}
+
+/**
+ * The sign-in methods that are switched on. The homeassistant checkbox is on unless its option is exactly false, so 0.4
+ * options keep working. The oidc checkbox is the other way round: it is on only when exactly true.
+ */
 function enabled_methods(options) {
-	return options.homeassistant === false ? [] : ["homeassistant"];
+	const methods = [];
+
+	if (options.homeassistant !== false)
+		methods.push("homeassistant");
+
+	if (options.oidc === true)
+		methods.push("oidc");
+
+	return methods;
 }
 
 /** Problems with the add-on options, as messages that name options and never contain their values. */
@@ -20,11 +36,22 @@ export function check_options(options) {
 
 	const problems = [];
 
-	if (methods.includes("homeassistant")) {
-		for (const name of ["public_url", "home_assistant_public_url"]) {
-			if (typeof options[name] !== "string" || options[name] === "")
-				problems.push(`${name} is required while the homeassistant sign-in method is on`);
+	if (!is_set(options.public_url))
+		problems.push("public_url is required while a sign-in method is on");
+
+	if (methods.includes("homeassistant") && !is_set(options.home_assistant_public_url))
+		problems.push("home_assistant_public_url is required while the homeassistant sign-in method is on");
+
+	if (methods.includes("oidc")) {
+		for (const name of ["oidc_issuer", "oidc_client_id"]) {
+			if (!is_set(options[name]))
+				problems.push(`${name} is required while the oidc sign-in method is on`);
 		}
+
+		const allowlists = ["oidc_allowed_emails", "oidc_allowed_subjects", "oidc_required_group"];
+
+		if (!allowlists.some((name) => is_set(options[name])))
+			problems.push(`set at least one of ${allowlists.join(", ")} while the oidc sign-in method is on`);
 	}
 
 	return problems;
@@ -42,6 +69,16 @@ export function buildEnv(options) {
 		HOME_ASSISTANT_PUBLIC_URL: options.home_assistant_public_url,
 		// optional: without it the server allows only Claude's own return addresses
 		ALLOWED_REDIRECT_HOSTS: options.allowed_redirect_hosts,
+		// passed even while oidc is off: the server format-checks them and uses them to clean up a switched-off method
+		OIDC_ISSUER: options.oidc_issuer,
+		OIDC_CLIENT_ID: options.oidc_client_id,
+		OIDC_CLIENT_SECRET: options.oidc_client_secret,
+		OIDC_DISPLAY_NAME: options.oidc_display_name,
+		OIDC_ALLOWED_EMAILS: options.oidc_allowed_emails,
+		OIDC_ALLOWED_SUBJECTS: options.oidc_allowed_subjects,
+		OIDC_REQUIRED_GROUP: options.oidc_required_group,
+		OIDC_GROUPS_CLAIM: options.oidc_groups_claim,
+		OIDC_AUTH_PARAMS: options.oidc_auth_params,
 	};
 
 	// unset or empty values are left out so the server's own configuration check names what is missing

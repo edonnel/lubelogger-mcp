@@ -253,6 +253,32 @@ await check("a missing URL is named, and no option value appears in any message"
   assert.ok(check_options({ ...addonOptions, home_assistant_public_url: undefined }).some((p) => /home_assistant_public_url/.test(p)));
 });
 
+await check("the oidc checkbox adds oidc to AUTH_METHODS and passes its options", () => {
+  const options = { ...addonOptions, oidc: true, oidc_issuer: "https://idp.example.com", oidc_client_id: "x", oidc_allowed_emails: "alice@example.com" };
+  assert.deepEqual(check_options(options), []);
+  const env = buildEnv(options);
+  assert.equal(env.AUTH_METHODS, "homeassistant,oidc");
+  assert.equal(env.OIDC_ISSUER, "https://idp.example.com");
+  assert.ok(validateConfig(env).ok);
+});
+
+await check("oidc on without its settings names each one, never a value", () => {
+  const problems = check_options({ ...addonOptions, oidc: true, oidc_client_secret: "SECRET-PLANTED-58" });
+  for (const name of ["oidc_issuer", "oidc_client_id", "oidc_allowed_emails"]) assert.ok(problems.some((p) => p.includes(name)), name);
+  assert.ok(problems.every((p) => !p.includes("SECRET-PLANTED-58")));
+});
+
+await check("oidc alone still requires public_url", () => {
+  const options = { lubelogger_url: "http://lubelogger:8080", lubelogger_api_key: "k", homeassistant: false, oidc: true, oidc_issuer: "https://idp.example.com", oidc_client_id: "x", oidc_allowed_subjects: "s" };
+  assert.ok(check_options(options).some((p) => /public_url/.test(p)));
+});
+
+await check("a switched-off oidc keeps its settings in the environment for cleanup", () => {
+  const env = buildEnv({ ...addonOptions, oidc: false, oidc_issuer: "https://idp.example.com", oidc_client_id: "x" });
+  assert.equal(env.AUTH_METHODS, "homeassistant");
+  assert.equal(env.OIDC_ISSUER, "https://idp.example.com");
+});
+
 if (failed) {
   console.error(`${failed} check(s) failed`);
   process.exit(1);
