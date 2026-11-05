@@ -123,8 +123,9 @@ function config(over = {}) {
 }
 
 let running;
-async function start() {
-  const built = await createApp(config(), { loginMethods: { homeassistant: stub }, now });
+const start = () => startWith(config(), { loginMethods: { homeassistant: stub }, now });
+async function startWith(cfg, deps) {
+  const built = await createApp(cfg, deps);
   const server = await new Promise((resolve) => {
     const s = built.app.listen(0, "127.0.0.1", () => resolve(s));
   });
@@ -775,8 +776,8 @@ await check("a connection unused for 90 days expires", async () => {
   assert.equal(stub.cleaned.length, before + 1);
 });
 
-const storedConnections = async () =>
-  Object.values(JSON.parse(await fs.readFile(path.join(dataDir, "oauth.json"), "utf8")).connections);
+const storedConnections = async (dir = dataDir) =>
+  Object.values(JSON.parse(await fs.readFile(path.join(dir, "oauth.json"), "utf8")).connections);
 
 await check("expired connections that are never presented again are purged at startup", async () => {
   // every connection left from the tests above is now more than 90 days unused, and none is presented again
@@ -862,6 +863,148 @@ await check("logins are logged by name, never with a token or code", async () =>
 });
 
 await stop();
+
+// ---------- two sign-in methods on one server ----------
+// a second stub, for oidc: start sends the browser back as whoever `stubOidc.next` names, and counts its calls
+const stubOidc = {
+  next: "alice",
+  started: 0,
+  cleaned: [],
+  sessions: 0,
+  async start(loginState, res) {
+    this.started++;
+    secrets.add(loginState);
+    res.redirect(302, `/login/callback?state=${encodeURIComponent(loginState)}&as=${encodeURIComponent(this.next)}`);
+  },
+  async finish(req) {
+    const name = String(req.query.as);
+    this.sessions++;
+    return { person: { id: `oidc-${name}`, name }, upstream: { session: `oidc-up-${name}-${this.sessions}`, name } };
+  },
+  async recheck(upstream) {
+    return { ok: true, upstream, person: { id: `oidc-${upstream.name}`, name: upstream.name } };
+  },
+  async cleanup(upstream) {
+    this.cleaned.push(upstream.session);
+  },
+};
+
+const twoDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-two-"));
+const OIDC_SETTINGS = {
+  OIDC_ISSUER: "https://idp.example.com",
+  OIDC_CLIENT_ID: "x",
+  OIDC_ALLOWED_SUBJECTS: "s",
+  OIDC_DISPLAY_NAME: "Example ID",
+};
+const twoConfig = (over = {}) =>
+  config({ AUTH_METHODS: "homeassistant,oidc", AUTH_MODE: undefined, ...OIDC_SETTINGS, DATA_DIR: twoDir, ...over });
+const startTwo = () => startWith(twoConfig(), { loginMethods: { homeassistant: stub, oidc: stubOidc }, now });
+
+// beginLogin through the button of `method`
+const beginWith = (method) => async (client, name) => {
+  const { loginState, verifier, cookie } = await openApproval(client, name);
+  const r = await approve(loginState, cookie, {}, method);
+  assert.equal(r.status, 302, await r.text());
+  return { callback: r.headers.get("location"), verifier, cookie };
+};
+
+await startTwo();
+
+{
+  const claude = await register();
+  let viaOidc;
+
+  await check("the screen shows both buttons, in config order, with the OIDC provider's name", async () => {
+    const { html } = await openApproval(claude, "alice");
+    const buttons = [...html.matchAll(/name="method" value="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(buttons, ["homeassistant", "oidc"]);
+    assert.match(html, /Continue with Example ID<\/button>/);
+  });
+
+  await check("a login state locked to one method refuses a second", async () => {
+    const { loginState, cookie } = await openApproval(claude, "alice");
+    assert.equal((await approve(loginState, cookie, {}, "homeassistant")).status, 302);
+    const second = await approve(loginState, cookie, {}, "oidc");
+    assert.equal(second.status, 400);
+    assert.match(await second.text(), /Login expired/);
+    assert.equal(stubOidc.started, 0);
+  });
+
+  await check("the same person through both methods gets two connections, neither replaced", async () => {
+    const haBefore = stub.cleaned.length;
+    const oidcBefore = stubOidc.cleaned.length;
+    const viaHa = await login(claude, "alice", beginWith("homeassistant"));
+    stubOidc.next = "alice";
+    viaOidc = await login(claude, "alice", beginWith("oidc"));
+    assert.equal(stubOidc.started, 1);
+
+    const r1 = await refresh(claude, viaHa.refresh_token);
+    assert.equal(r1.status, 200);
+    remember(await r1.json());
+    const r2 = await refresh(claude, viaOidc.refresh_token);
+    assert.equal(r2.status, 200);
+    viaOidc = remember(await r2.json());
+
+    assert.equal(stub.cleaned.length, haBefore, "the homeassistant connection was not replaced");
+    assert.equal(stubOidc.cleaned.length, oidcBefore, "the oidc connection was not replaced");
+    const stored = await storedConnections(twoDir);
+    assert.deepEqual(stored.map((c) => c.method).sort(), ["homeassistant", "oidc"]);
+  });
+
+  await check("a switched-off method that is still configured has its upstream session revoked", async () => {
+    await stop();
+    const oidcBefore = stubOidc.cleaned.length;
+    const haBefore = stub.cleaned.length;
+    const mark = logs.length;
+    // homeassistant only, with the OIDC settings still present
+    await startWith(config({ ...OIDC_SETTINGS, DATA_DIR: twoDir }), {
+      loginMethods: { homeassistant: stub },
+      retiredMethods: { oidc: stubOidc },
+      now,
+    });
+    assert.equal(stubOidc.cleaned.length, oidcBefore + 1, "the oidc session was revoked through the retired method");
+    assert.match(stubOidc.cleaned.at(-1), /^oidc-up-alice-/);
+    assert.equal(stub.cleaned.length, haBefore, "the homeassistant connection was left alone");
+    assert.deepEqual((await storedConnections(twoDir)).map((c) => c.method), ["homeassistant"]);
+    const since = logs.slice(mark);
+    assert.ok(since.some((l) => l.includes('disconnected "alice" (sign-in method switched off)')));
+    assert.ok(!since.some((l) => l.includes("could not be revoked")));
+    // still switched off for sign-in and refresh
+    assert.equal((await refresh(claude, viaOidc.refresh_token)).status, 400);
+    const { loginState, cookie } = await openApproval(claude, "alice");
+    const r = await approve(loginState, cookie, {}, "oidc");
+    assert.equal(r.status, 400);
+    assert.match(await r.text(), /not available/);
+  });
+
+  await stop();
+}
+
+await check("with the identity provider down, the server still starts", async () => {
+  // a port that was free a moment ago and has nothing listening now
+  const probe = http.createServer();
+  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+  const port = probe.address().port;
+  await new Promise((r) => probe.close(r));
+
+  const downDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-idp-down-"));
+  try {
+    await startWith(twoConfig({ OIDC_ISSUER: `http://127.0.0.1:${port}`, DATA_DIR: downDir }), {
+      loginMethods: { homeassistant: stub },
+      now,
+    });
+    const health = await get("/healthz");
+    assert.equal(health.status, 200);
+    const { html } = await openApproval(await register(), "alice");
+    assert.match(html, /Continue with Example ID<\/button>/);
+    await stop();
+  } finally {
+    if (running) await stop();
+    await fs.rm(downDir, { recursive: true, force: true });
+  }
+});
+
+await fs.rm(twoDir, { recursive: true, force: true });
 
 // ---------- Home Assistant: the real login method against a mock HA ----------
 // The mock speaks HA's OAuth endpoints and the WebSocket auth handshake plus auth/current_user.

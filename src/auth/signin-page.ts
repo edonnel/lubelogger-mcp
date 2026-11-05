@@ -12,7 +12,7 @@ export const PAGE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 
 export type MethodChoice = { method: MethodName; label: string };
 
-/** Each method's button text. Step 2 replaces the `oidc` label with the provider's display name. */
+/** Each method's fallback button text. app.ts gives the provider an `oidc` label naming the OIDC provider. */
 export const BUTTON_LABEL: Record<MethodName, string> = {
   homeassistant: "Continue with Home Assistant",
   oidc: "Continue with single sign-on",
@@ -63,6 +63,11 @@ const METHOD_ICON: Partial<Record<MethodName, string>> = {
   homeassistant:
     "<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" aria-hidden=\"true\">" +
     "<path fill=\"#41BDF5\" d=\"M12 2 2 11h3v10h14V11h3z\"/><circle cx=\"12\" cy=\"13.5\" r=\"2.4\" fill=\"#fff\"/></svg>",
+  // a generic key, in the text colour: any OpenID Connect provider
+  oidc:
+    "<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" " +
+    "stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">" +
+    "<circle cx=\"7.5\" cy=\"15.5\" r=\"4.5\"/><path d=\"m10.7 12.3 9.8-9.8M17 6l3 3M14.5 8.5l2 2\"/></svg>",
 };
 
 /** A whole page in the sign-in flow's look. `body` is trusted HTML: escape anything interpolated into it. */

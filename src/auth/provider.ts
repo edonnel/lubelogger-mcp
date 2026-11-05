@@ -144,6 +144,12 @@ export class LoginProvider implements OAuthServerProvider {
   // the origin a browser posting the sign-in form reports, when it reports one
   private readonly publicOrigin: string | undefined;
 
+  // button text that replaces a method's fallback label, such as the OIDC provider's name
+  private readonly labels: Partial<Record<MethodName, string>>;
+
+  // switched off but still configured: used only to revoke old connections' upstream sessions
+  private readonly retired: ReadonlyMap<MethodName, LoginMethod>;
+
   private lastPurge: number;
 
   private purging: Promise<void> | undefined;
@@ -154,10 +160,17 @@ export class LoginProvider implements OAuthServerProvider {
     private readonly store: AuthStore,
     private readonly methods: ReadonlyMap<MethodName, LoginMethod>,
     private readonly now: () => number = Date.now,
-    opts: { allowedRedirectHosts?: readonly string[]; publicUrl?: string } = {},
+    opts: {
+      allowedRedirectHosts?: readonly string[];
+      publicUrl?: string;
+      labels?: Partial<Record<MethodName, string>>;
+      retired?: ReadonlyMap<MethodName, LoginMethod>;
+    } = {},
   ) {
     if (methods.size === 0) throw new Error("at least one sign-in method is required");
     this.allowedRedirectHosts = opts.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS;
+    this.labels = opts.labels ?? {};
+    this.retired = opts.retired ?? new Map();
     this.publicOrigin = opts.publicUrl ? new URL(opts.publicUrl).origin : undefined;
     this.lastPurge = this.now();
     this.clientsStore = {
@@ -200,7 +213,7 @@ export class LoginProvider implements OAuthServerProvider {
 
     const name = client.client_name?.trim() ? client.client_name.trim() : "An unnamed app";
     // one button per method, in the order the methods were configured
-    const choices = [...this.methods.keys()].map((method) => ({ method, label: BUTTON_LABEL[method] }));
+    const choices = [...this.methods.keys()].map((method) => ({ method, label: this.labels[method] ?? BUTTON_LABEL[method] }));
     res
       .status(200)
       .set(PAGE_HEADERS)
@@ -533,9 +546,12 @@ export class LoginProvider implements OAuthServerProvider {
     for (const [key, grant] of this.access) if (grant.connectionId === connectionId) this.access.delete(key);
   }
 
-  /** Ends an upstream session through the method that made it. Best effort when that method is switched off. */
+  /**
+   * Ends an upstream session through the method that made it, or through that method's retired copy when it is
+   * switched off but still configured. Best effort when it is neither.
+   */
   private async safeCleanup(upstream: Record<string, unknown>, person: Person, method: MethodName): Promise<void> {
-    const login = this.methods.get(method);
+    const login = this.methods.get(method) ?? this.retired.get(method);
     if (!login) {
       log(`upstream session for ${who(person)} could not be revoked (${METHOD_OFF})`);
       return;

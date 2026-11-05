@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { HomeAssistantLogin } from "./auth/homeassistant.js";
 import type { LoginMethod } from "./auth/login-method.js";
+import { OidcLogin } from "./auth/oidc.js";
 import { LoginProvider } from "./auth/provider.js";
 import { mountOAuth, plainErrorPage } from "./auth/routes.js";
 import { AuthStore } from "./auth/store.js";
@@ -34,8 +35,15 @@ const INSTRUCTIONS = [
 /** The endpoint in every OAuth mode; config refuses a custom MCP_PATH there. */
 const OAUTH_ENDPOINT = "/mcp";
 
-/** `loginMethods` replaces the real implementation of any method it names; tests inject stubs. */
-export type AppDeps = { loginMethods?: Partial<Record<MethodName, LoginMethod>>; now?: () => number };
+/**
+ * `loginMethods` replaces the real implementation of any method it names, and `retiredMethods` that of any
+ * switched-off method used for cleanup; tests inject stubs.
+ */
+export type AppDeps = {
+  loginMethods?: Partial<Record<MethodName, LoginMethod>>;
+  retiredMethods?: Partial<Record<MethodName, LoginMethod>>;
+  now?: () => number;
+};
 
 export async function createApp(
   config: Config,
@@ -82,6 +90,11 @@ export async function createApp(
     for (const name of config.AUTH_METHODS)
       methods.set(name, deps.loginMethods?.[name] ?? buildLoginMethod(name, config, publicUrl));
 
+    // switched off but still configured: kept only to revoke the upstream sessions of their old connections
+    const retired = buildRetiredMethods(config, publicUrl);
+    for (const [name, method] of Object.entries(deps.retiredMethods ?? {}) as [MethodName, LoginMethod][])
+      if (!methods.has(name)) retired.set(name, method);
+
     // HA fetches its client ID (PUBLIC_URL + "/") to show the app's name and find its redirect URI
     const clientPage =
       "<!doctype html><html><head><meta charset=\"utf-8\"><title>LubeLogger MCP</title>" +
@@ -95,6 +108,8 @@ export async function createApp(
     const provider = new LoginProvider(store, methods, deps.now, {
       allowedRedirectHosts: config.ALLOWED_REDIRECT_HOSTS,
       publicUrl,
+      labels: { oidc: `Continue with ${config.OIDC_DISPLAY_NAME}` },
+      retired,
     });
     // connections unused for 90 days go now and hourly after, not only when one is presented again
     await provider.startPurging();
@@ -145,7 +160,35 @@ function buildLoginMethod(name: MethodName, config: Config, publicUrl: string): 
       haUrl: config.HOME_ASSISTANT_URL,
     });
   }
+  if (name === "oidc") {
+    if (!config.OIDC_ISSUER || !config.OIDC_CLIENT_ID)
+      throw new Error("OIDC_ISSUER and OIDC_CLIENT_ID are required for the oidc sign-in method");
+    // discovery is lazy, so building this makes no network call
+    return new OidcLogin({
+      publicUrl,
+      issuer: config.OIDC_ISSUER,
+      clientId: config.OIDC_CLIENT_ID,
+      clientSecret: config.OIDC_CLIENT_SECRET,
+      allowedEmails: config.OIDC_ALLOWED_EMAILS,
+      allowedSubjects: config.OIDC_ALLOWED_SUBJECTS,
+      requiredGroup: config.OIDC_REQUIRED_GROUP,
+      groupsClaim: config.OIDC_GROUPS_CLAIM,
+      authParams: config.OIDC_AUTH_PARAMS,
+    });
+  }
   throw new Error(`sign-in method ${name} is not available in this version`);
+}
+
+/** A method for each sign-in method that is off but still configured, so old connections' sessions can be revoked. */
+function buildRetiredMethods(config: Config, publicUrl: string): Map<MethodName, LoginMethod> {
+  const configured: Partial<Record<MethodName, boolean>> = {
+    homeassistant: Boolean(config.HOME_ASSISTANT_URL && config.HOME_ASSISTANT_PUBLIC_URL),
+    oidc: Boolean(config.OIDC_ISSUER && config.OIDC_CLIENT_ID),
+  };
+  const retired = new Map<MethodName, LoginMethod>();
+  for (const [name, isConfigured] of Object.entries(configured) as [MethodName, boolean][])
+    if (isConfigured && !config.AUTH_METHODS.includes(name)) retired.set(name, buildLoginMethod(name, config, publicUrl));
+  return retired;
 }
 
 function escapeAttr(s: string): string {
