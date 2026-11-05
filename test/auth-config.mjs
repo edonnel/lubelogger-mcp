@@ -302,6 +302,39 @@ await check("a switched-off oidc keeps its settings in the environment for clean
   assert.equal(env.OIDC_ISSUER, "https://idp.example.com");
 });
 
+await check("the lubelogger_password and lubelogger_key checkboxes add their methods in order", () => {
+  const options = { ...addonOptions, oidc: true, oidc_issuer: "https://idp.example.com", oidc_client_id: "x", oidc_allowed_emails: "alice@example.com", lubelogger_password: true, lubelogger_key: true, lubelogger_allowed_users: "alice" };
+  assert.deepEqual(check_options(options), []);
+  const env = buildEnv(options);
+  assert.equal(env.AUTH_METHODS, "homeassistant,oidc,lubelogger-password,lubelogger-key");
+  assert.equal(env.LUBELOGGER_ALLOWED_USERS, "alice");
+  const r = validateConfig(env);
+  assert.equal(r.ok, true, JSON.stringify(r.problems));
+  // only exactly true switches them on
+  assert.equal(buildEnv({ ...addonOptions, lubelogger_password: "true", lubelogger_key: 1 }).AUTH_METHODS, "homeassistant");
+});
+
+await check("lubelogger_password on without lubelogger_allowed_users names it", () => {
+  const problems = check_options({ ...addonOptions, lubelogger_password: true });
+  assert.ok(problems.some((p) => p.includes("lubelogger_allowed_users")));
+  assert.ok(check_options({ ...addonOptions, lubelogger_password: true, lubelogger_allowed_users: "alice" }).length === 0);
+  // not required while the method is off
+  assert.deepEqual(check_options(addonOptions), []);
+});
+
+await check("lubelogger_key alone needs no lubelogger_api_key; anything else still does", () => {
+  const key_only = { ...addonOptions, lubelogger_api_key: "", homeassistant: false, lubelogger_key: true };
+  assert.deepEqual(check_options(key_only), []);
+  const both = { ...key_only, homeassistant: true, lubelogger_api_key: "" };
+  assert.ok(check_options(both).some((p) => p.includes("lubelogger_api_key")));
+  const password_only = { ...addonOptions, lubelogger_api_key: "SECRET-PLANTED-91", homeassistant: false, lubelogger_password: true };
+  assert.deepEqual(check_options(password_only), ["lubelogger_allowed_users is required while the lubelogger-password sign-in method is on"]);
+  const missing = check_options({ ...password_only, lubelogger_api_key: undefined, lubelogger_allowed_users: "alice" });
+  assert.ok(missing.some((p) => p.includes("lubelogger_api_key")));
+  const planted = check_options({ ...both, lubelogger_api_key: "", lubelogger_allowed_users: "SECRET-PLANTED-91" });
+  assert.ok(planted.every((p) => !p.includes("SECRET-PLANTED-91")));
+});
+
 if (failed) {
   console.error(`${failed} check(s) failed`);
   process.exit(1);

@@ -13,14 +13,19 @@ options:
   lubelogger_api_key: ""
   homeassistant: true
   oidc: false
+  lubelogger_password: false
+  lubelogger_key: false
 schema:
   lubelogger_url: url
-  lubelogger_api_key: password
+  lubelogger_api_key: password?
   homeassistant: bool?
   public_url: url?
   home_assistant_public_url: url?
   allowed_redirect_hosts: str?
   oidc: bool?
+  lubelogger_password: bool?
+  lubelogger_key: bool?
+  lubelogger_allowed_users: str?
   oidc_issuer: url?
   oidc_client_id: str?
   oidc_client_secret: password?

@@ -13,7 +13,8 @@ function is_set(value) {
 
 /**
  * The sign-in methods that are switched on. The homeassistant checkbox is on unless its option is exactly false, so 0.4
- * options keep working. The oidc checkbox is the other way round: it is on only when exactly true.
+ * options keep working. The oidc, lubelogger_password and lubelogger_key checkboxes are the other way round: each is on
+ * only when exactly true.
  */
 function enabled_methods(options) {
 	const methods = [];
@@ -23,6 +24,12 @@ function enabled_methods(options) {
 
 	if (options.oidc === true)
 		methods.push("oidc");
+
+	if (options.lubelogger_password === true)
+		methods.push("lubelogger-password");
+
+	if (options.lubelogger_key === true)
+		methods.push("lubelogger-key");
 
 	return methods;
 }
@@ -54,6 +61,15 @@ export function check_options(options) {
 			problems.push(`set at least one of ${allowlists.join(", ")} while the oidc sign-in method is on`);
 	}
 
+	if (methods.includes("lubelogger-password") && !is_set(options.lubelogger_allowed_users))
+		problems.push("lubelogger_allowed_users is required while the lubelogger-password sign-in method is on");
+
+	// the key alone signs in with the key the person types, so the stored one is optional only then
+	const key_only = methods.length === 1 && methods[0] === "lubelogger-key";
+
+	if (!key_only && !is_set(options.lubelogger_api_key))
+		problems.push("lubelogger_api_key is required unless lubelogger-key is the only sign-in method on");
+
 	return problems;
 }
 
@@ -62,6 +78,7 @@ export function buildEnv(options) {
 	const env = {
 		LUBELOGGER_URL: options.lubelogger_url,
 		LUBELOGGER_API_KEY: options.lubelogger_api_key,
+		LUBELOGGER_ALLOWED_USERS: options.lubelogger_allowed_users,
 		AUTH_METHODS: enabled_methods(options).join(","),
 		HOME_ASSISTANT_URL: "http://homeassistant:8123",
 		DATA_DIR: STATE_DIR,
