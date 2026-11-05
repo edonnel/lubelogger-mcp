@@ -119,3 +119,24 @@ This replaces the approved design's three releases. Each step can be tested and 
 - Tests: the signature check on refresh, the timeout path, cleanup throwing, the real retired-method build, markup in `OIDC_DISPLAY_NAME`, per-check baselines for `stubOidc.started`, and a test helper that names which bad-token case failed.
 - Launcher: treat whitespace-only options as unset; test that `oidc` alone doesn't require `home_assistant_public_url`.
 - `.env.example`: one comment per allowlist setting, and the "Home Assistant mode" wording on `DATA_DIR` and `ALLOWED_REDIRECT_HOSTS`.
+
+## Follow-ups after step 3 (from its reviews; none lets anyone in)
+
+- Treat only a 401 from LubeLogger as rejected credentials. Today any non-401 4xx (a wrong URL, a proxy's 404 or 429) counts as a wrong password at sign-in, or ends a key connection on refresh.
+- A key with characters a header can't carry reports "can't be reached" instead of "not valid".
+- Optional: refuse a credentialed `/api/whoami` answer of `isRoot: True` unless that account is allowlisted. That guards the brief window if LubeLogger's login is switched off mid-sign-in.
+- Lockout messages: the wait shown can overstate, at "15 minutes" for in-flight-only refusals, while saturated, or with 6+ counted failures.
+- After a 401, a key connection's error tells the person to check `LUBELOGGER_API_KEY`, which is the wrong key for that connection.
+- `provider.ts` is about 700 lines; the form path (`checkForm`) could move to its own module.
+- Username case: the limiter's `toLowerCase` may fold differently from LubeLogger's lookup for rare characters (unverified).
+- Tests:
+  - a colon in the username;
+  - the probe succeeding while only the credentialed call fails;
+  - the post-await race re-check;
+  - `=== 5` in the concurrency test;
+  - the token-mode key test asserting its problem.
+- Docs and config polish:
+  - the README's env fence tag and startup-log examples;
+  - the long `.env.example` line;
+  - `LUBELOGGER_ALLOWED_USERS` sitting inside the OIDC settings block;
+  - the launcher's `is_set` accepting whitespace.
