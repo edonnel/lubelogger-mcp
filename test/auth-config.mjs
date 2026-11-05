@@ -99,12 +99,6 @@ check("ALLOWED_REDIRECT_HOSTS is split, trimmed and lower-cased", () => {
   assert.deepEqual(r.config.ALLOWED_REDIRECT_HOSTS, ["claude.ai", "localhost", "app.example.com"]);
 });
 
-check("oidc is not available in this version", () => {
-  const r = validateConfig({ ...base, AUTH_MODE: "oidc" });
-  assert.equal(r.ok, false);
-  assert.ok(r.problems.some((p) => /not available in this version/.test(p)));
-});
-
 const ha = {
   ...base,
   PUBLIC_URL: "https://mcp.example.com",
@@ -140,10 +134,67 @@ await check("AUTH_METHODS refuses unknown, duplicate and empty lists", () => {
     assert.ok(r.problems.some((p) => p.startsWith("AUTH_METHODS") && needle.test(p)), r.problems.join("\n"));
   }
 });
-await check("methods planned for later refuse to start", () => {
-  const r = validateConfig({ ...ha, AUTH_METHODS: "homeassistant,oidc" });
+const oidc = {
+  ...base,
+  PUBLIC_URL: "https://mcp.example.com",
+  OIDC_ISSUER: "https://idp.example.com/realms/home",
+  OIDC_CLIENT_ID: "lubelogger-mcp",
+  OIDC_ALLOWED_EMAILS: "alice@example.com",
+};
+
+await check("AUTH_METHODS=oidc with an issuer, client and allowlist starts", () => {
+  const r = validateConfig({ ...oidc, AUTH_METHODS: "oidc" });
+  assert.ok(r.ok, JSON.stringify(r.problems));
+  assert.deepEqual(r.config.AUTH_METHODS, ["oidc"]);
+  assert.deepEqual(r.config.OIDC_ALLOWED_EMAILS, ["alice@example.com"]);
+  assert.equal(r.config.OIDC_DISPLAY_NAME, "single sign-on");
+  assert.equal(r.config.OIDC_GROUPS_CLAIM, "groups");
+});
+await check("both methods together start, in the order given", () => {
+  const r = validateConfig({ ...ha, ...oidc, AUTH_METHODS: "oidc,homeassistant" });
+  assert.deepEqual(r.config.AUTH_METHODS, ["oidc", "homeassistant"]);
+});
+await check("oidc without an allowlist refuses to start", () => {
+  const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: undefined, AUTH_METHODS: "oidc" });
   assert.equal(r.ok, false);
-  assert.ok(r.problems.some((p) => /oidc.*not available in this version/.test(p)));
+  assert.ok(r.problems.some((p) => /OIDC_ALLOWED_EMAILS, OIDC_ALLOWED_SUBJECTS or OIDC_REQUIRED_GROUP/.test(p)));
+});
+await check("oidc names each missing setting", () => {
+  const r = validateConfig({ ...base, PUBLIC_URL: "https://mcp.example.com", OIDC_ALLOWED_SUBJECTS: "abc", AUTH_METHODS: "oidc" });
+  for (const name of ["OIDC_ISSUER", "OIDC_CLIENT_ID"])
+    assert.ok(r.problems.some((p) => p.startsWith(name) && /oidc sign-in method/.test(p)), name);
+});
+await check("an issuer must be https, except on localhost", () => {
+  assert.equal(validateConfig({ ...oidc, OIDC_ISSUER: "http://idp.example.com", AUTH_METHODS: "oidc" }).ok, false);
+  assert.ok(validateConfig({ ...oidc, OIDC_ISSUER: "http://localhost:9000/realms/home", AUTH_METHODS: "oidc" }).ok);
+  assert.ok(validateConfig({ ...oidc, OIDC_ISSUER: "http://127.0.0.1:9000", AUTH_METHODS: "oidc" }).ok);
+});
+await check("lubelogger methods still refuse to start", () => {
+  const r = validateConfig({ ...ha, AUTH_METHODS: "homeassistant,lubelogger-key" });
+  assert.ok(r.problems.some((p) => /lubelogger-key.*not available in this version/.test(p)));
+});
+await check("no OIDC setting value appears in any problem", () => {
+  const r = validateConfig({ ...oidc, OIDC_CLIENT_SECRET: "SECRET-PLANTED-31", OIDC_ISSUER: "not a url", AUTH_METHODS: "oidc" });
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.every((p) => !p.includes("SECRET-PLANTED-31")));
+});
+await check("list settings are split on commas, trimmed, empties dropped; issuer slashes trimmed", () => {
+  const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: " a@example.com, ,b@example.com,", OIDC_ISSUER: "https://idp.example.com/realms/home//", AUTH_METHODS: "oidc" });
+  assert.deepEqual(r.config.OIDC_ALLOWED_EMAILS, ["a@example.com", "b@example.com"]);
+  assert.equal(r.config.OIDC_ISSUER, "https://idp.example.com/realms/home");
+});
+await check("a required group alone satisfies the allowlist", () => {
+  const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: undefined, OIDC_REQUIRED_GROUP: "mcp", AUTH_METHODS: "oidc" });
+  assert.ok(r.ok, JSON.stringify(r.problems));
+});
+await check("oidc settings are format-checked when oidc is off, and never required", () => {
+  assert.ok(validateConfig({ ...ha, AUTH_METHODS: "homeassistant" }).ok);
+  const r = validateConfig({ ...ha, AUTH_METHODS: "homeassistant", OIDC_ISSUER: "http://idp.example.com" });
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => p.startsWith("OIDC_ISSUER")));
+});
+await check("AUTH_MODE=oidc is accepted", () => {
+  assert.ok(validateConfig({ ...oidc, AUTH_MODE: "oidc" }).ok);
 });
 await check("AUTH_METHODS with a non-token AUTH_MODE refuses to start", () => {
   const r = validateConfig({ ...ha, AUTH_MODE: "homeassistant", AUTH_METHODS: "homeassistant" });

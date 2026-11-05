@@ -27,7 +27,7 @@ export const METHOD_NAMES = ["homeassistant", "oidc", "lubelogger-password", "lu
 export type MethodName = (typeof METHOD_NAMES)[number];
 
 /** This version implements these methods; the rest are accepted by the schema but refuse to start. */
-const AVAILABLE_METHODS: readonly MethodName[] = ["homeassistant"];
+const AVAILABLE_METHODS: readonly MethodName[] = ["homeassistant", "oidc"];
 
 /** A bare origin: trailing slashes are trimmed and any path, query or fragment is refused. */
 const originUrl = (example: string) =>
@@ -40,6 +40,22 @@ const originUrl = (example: string) =>
       return u.pathname === "/" && !u.search && !u.hash;
     }, `must be an address only, with no path (e.g. ${example})`);
 
+/** Comma-separated list setting: split, trimmed, empty entries dropped. */
+const commaList = z
+  .string()
+  .default("")
+  .transform((v) => v.split(",").map((e) => e.trim()).filter((e) => e !== ""));
+
+/** An OpenID Connect issuer: trailing slashes trimmed, a path allowed, https only (plain http on localhost for testing). */
+const issuerUrl = z
+  .string()
+  .url("must be a full URL, e.g. https://idp.example.com/realms/home")
+  .transform((v) => v.replace(/\/+$/, ""))
+  .refine((v) => {
+    const u = new URL(v);
+    return u.protocol === "https:" || (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1"));
+  }, "must use https (http is accepted only for localhost or 127.0.0.1)");
+
 const authSchema = z.object({
   AUTH_MODE: z.enum(["token", "homeassistant", "oidc", "lubelogger-key", "lubelogger-password"]).default("token"),
   /** Sign-in methods to offer, comma-separated, in order. Mutually exclusive with a non-token AUTH_MODE. */
@@ -50,6 +66,19 @@ const authSchema = z.object({
   HOME_ASSISTANT_PUBLIC_URL: originUrl("https://homeassistant.example.com").optional(),
   /** Address of Home Assistant as this server reaches it, e.g. http://homeassistant:8123. */
   HOME_ASSISTANT_URL: originUrl("http://homeassistant:8123").optional(),
+  /** OpenID Connect: the issuer's address, the client registered for this server, and an optional client secret. */
+  OIDC_ISSUER: issuerUrl.optional(),
+  OIDC_CLIENT_ID: z.string().min(1).optional(),
+  OIDC_CLIENT_SECRET: z.string().min(1).optional(),
+  /** Name shown on the sign-in button. */
+  OIDC_DISPLAY_NAME: z.string().min(1).default("single sign-on"),
+  /** Who may sign in: any listed email or subject, or members of the required group. */
+  OIDC_ALLOWED_EMAILS: commaList,
+  OIDC_ALLOWED_SUBJECTS: commaList,
+  OIDC_REQUIRED_GROUP: z.string().min(1).optional(),
+  OIDC_GROUPS_CLAIM: z.string().min(1).default("groups"),
+  /** Extra query parameters for the authorization request, passed through as given. */
+  OIDC_AUTH_PARAMS: z.string().min(1).optional(),
   /** Where OAuth state is kept. */
   DATA_DIR: z.string().default("./data"),
   /** Hostnames an OAuth client may register as its redirect target, comma-separated. */
@@ -94,6 +123,8 @@ function resolveMethods(c: ResolveInput): { methods: MethodName[]; problems: { p
     return { methods: [], problems };
   }
 
+  const choices = ["token", ...AVAILABLE_METHODS];
+  const modeChoices = `${choices.slice(0, -1).join(", ")} or ${choices[choices.length - 1]}`;
   const methods: MethodName[] = [];
   const seen = new Set<string>();
   for (const name of names) {
@@ -115,7 +146,7 @@ function resolveMethods(c: ResolveInput): { methods: MethodName[]; problems: { p
         path: source,
         message:
           source === "AUTH_MODE"
-            ? `"${name}" is not available in this version (use token or homeassistant)`
+            ? `"${name}" is not available in this version (use ${modeChoices})`
             : `"${name}" is not available in this version (use ${AVAILABLE_METHODS.join(", ")})`,
       });
       continue;
@@ -172,6 +203,20 @@ const checkedSchema = fullSchema
             path: [name],
             message: "is required when the homeassistant sign-in method is on",
           });
+
+    if (methods.includes("oidc")) {
+      for (const name of ["OIDC_ISSUER", "OIDC_CLIENT_ID"] as const)
+        if (c[name] === undefined)
+          ctx.addIssue({ code: "custom", path: [name], message: "is required when the oidc sign-in method is on" });
+
+      if (c.OIDC_ALLOWED_EMAILS.length === 0 && c.OIDC_ALLOWED_SUBJECTS.length === 0 && c.OIDC_REQUIRED_GROUP === undefined)
+        ctx.addIssue({
+          code: "custom",
+          path: ["OIDC_ALLOWED_EMAILS"],
+          message:
+            "at least one of OIDC_ALLOWED_EMAILS, OIDC_ALLOWED_SUBJECTS or OIDC_REQUIRED_GROUP is required when the oidc sign-in method is on",
+        });
+    }
   })
   .transform((c) => ({ ...c, AUTH_METHODS: resolveMethods(c).methods }));
 
