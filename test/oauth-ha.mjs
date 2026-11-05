@@ -820,7 +820,7 @@ await check("a connection whose method is switched off is ended at refresh, and 
 
     // another method's stub: it must never be asked about a homeassistant connection
     const other = { ...stub, cleaned: [] };
-    assert.throws(() => new LoginProvider(store, new Map(), now), "a provider needs at least one method");
+    assert.throws(() => new LoginProvider(store, new Map(), now), /at least one sign-in method/);
     const provider = new LoginProvider(store, new Map([["oidc", other]]), now);
     const before = stub.cleaned.length;
 

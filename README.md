@@ -174,7 +174,7 @@ The sign-in screen has one button per method that is switched on. Only Home Assi
 
 **If it stops working for everyone.** Home Assistant's IP ban (`ip_ban_enabled`) is the one thing to watch: if it ever banned this server's address, every connection would end at its next refresh.
 
-**Switching a method off.** Taking a method out of `AUTH_METHODS` (or unchecking it in the add-on) ends its connections at their next refresh. If you also delete that method's settings, this server can no longer reach the upstream session to revoke it, so switch the method off first and delete its settings afterwards.
+**Switching a method off.** While the server still has other methods on, connections made with a method that has been switched off are removed, at the next start or at their next refresh, whichever comes first. Their sessions at the source are not revoked, because the server can only revoke through methods that are on, so delete them there yourself. For Home Assistant that is Profile, then Refresh tokens. In this version Home Assistant is the only method, so removing it puts the server back in token mode, which leaves the sign-in data alone: existing connections stay in the data file and work again if the method is switched back on within 90 days. The add-on will not start with no method switched on.
 
 The startup log says which methods are on: `auth homeassistant`, or `auth token` in token mode.
 

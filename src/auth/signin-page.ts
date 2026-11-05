@@ -3,12 +3,12 @@
 import type { MethodName } from "../config.js";
 
 /** The headers of every page the sign-in flow shows. */
-export const PAGE_HEADERS: Record<string, string> = {
+export const PAGE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
   "Cache-Control": "no-store",
   // never inside a frame, so a sign-in button cannot be clickjacked
   "X-Frame-Options": "DENY",
   "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
-};
+});
 
 export type MethodChoice = { method: MethodName; label: string };
 
