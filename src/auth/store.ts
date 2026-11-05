@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { METHOD_NAMES, type MethodName } from "../config.js";
 
 export const REFRESH_GRACE_MS = 60_000;
 export const IDLE_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000;
@@ -15,6 +16,7 @@ export type Person = { id: string; name: string };
 export type Connection = {
   id: string;
   clientId: string;
+  method: MethodName;
   person: Person;
   upstream: Record<string, unknown>;
   refreshHash: string;
@@ -82,9 +84,24 @@ export class AuthStore {
       }
       if (!isRecord(parsed) || !isRecord(parsed.clients) || !isRecord(parsed.connections))
         throw new Error(`${file} does not have the expected shape (clients and connections objects)`);
+      const connections = new Map<string, Connection>();
+
+      for (const [id, value] of Object.entries(parsed.connections)) {
+        if (!isRecord(value))
+          throw new Error(`${file} does not have the expected shape (a connection is not an object)`);
+
+        // a release 1 file has no method: those connections signed in with Home Assistant
+        const method = value.method ?? "homeassistant";
+
+        if (typeof method !== "string" || !(METHOD_NAMES as readonly string[]).includes(method))
+          throw new Error(`${file} does not have the expected shape (a connection has an unknown method)`);
+
+        connections.set(id, { ...value, method } as Connection);
+      }
+
       data = {
         clients: new Map(Object.entries(parsed.clients)) as Data["clients"],
-        connections: new Map(Object.entries(parsed.connections)) as Data["connections"],
+        connections,
       };
     }
 
@@ -104,7 +121,7 @@ export class AuthStore {
     let replaced: Connection | undefined;
 
     for (const existing of [...this.data.connections.values()]) {
-      if (existing.clientId === c.clientId && existing.person.id === c.person.id) {
+      if (existing.clientId === c.clientId && existing.method === c.method && existing.person.id === c.person.id) {
         replaced = existing;
         this.data.connections.delete(existing.id);
       }

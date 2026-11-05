@@ -34,6 +34,7 @@ function conn(over = {}) {
   return {
     id: "c1",
     clientId: "client-a",
+    method: "homeassistant",
     person: { id: "p1", name: "Alice" },
     upstream: { refresh_token: "ha-refresh" },
     refreshHash: hashToken("refresh-one"),
@@ -49,6 +50,33 @@ await check("a saved client survives reopening", async () => {
   const b = await AuthStore.open(dir, () => 1000);
   assert.equal(b.getClient("client-a")?.client_id, "client-a");
   assert.equal(b.getClient("nope"), undefined);
+});
+
+await check("a connection with another method is kept, not replaced", async () => {
+  const dir = await tmp();
+  const s = await AuthStore.open(dir, () => 1000);
+  await s.putConnection(conn());
+  const old = await s.putConnection(conn({ id: "c2", method: "oidc", refreshHash: hashToken("r2") }));
+  assert.equal(old, undefined);
+  assert.ok(s.findByRefresh("client-a", "refresh-one"));
+  assert.ok(s.findByRefresh("client-a", "r2"));
+});
+
+await check("a release 1 file without methods loads as homeassistant", async () => {
+  const dir = await tmp();
+  const legacy = conn({ refreshHash: hashToken("legacy") });
+  delete legacy.method;
+  await fs.writeFile(path.join(dir, "oauth.json"), JSON.stringify({ clients: {}, connections: { c1: legacy } }));
+  const s = await AuthStore.open(dir, () => 1000);
+  assert.equal(s.findByRefresh("client-a", "legacy")?.connection.method, "homeassistant");
+});
+
+await check("a method that is not a known name is refused without quoting the file", async () => {
+  for (const method of ["secret-marker-value", 5]) {
+    const dir = await tmp();
+    await fs.writeFile(path.join(dir, "oauth.json"), JSON.stringify({ clients: {}, connections: { c1: conn({ method }) } }));
+    await assert.rejects(AuthStore.open(dir, () => 1000), (err) => /expected shape/.test(err.message) && !err.message.includes("secret-marker-value"));
+  }
 });
 
 await check("putConnection replaces the same client and person and returns the old one", async () => {

@@ -326,6 +326,8 @@ export class LoginProvider implements OAuthServerProvider {
     const refreshToken = newSecret();
     const connection: Connection = {
       id: randomUUID(),
+      // stopgap until the chooser records the real method
+      method: "homeassistant",
       clientId: client.client_id,
       person: entry.person,
       upstream: entry.upstream,
