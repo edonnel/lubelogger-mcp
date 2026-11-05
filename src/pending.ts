@@ -13,7 +13,7 @@ export interface PendingRecord {
   body: Record<string, unknown>;
   /** True when body replaces an existing record of this kind instead of adding one. */
   update?: boolean;
-  /** Who proposed it; only they can commit it. "token" in token mode, the person's id in OAuth modes. */
+  /** Who proposed it; only they can commit it. "token" in token mode, "<method>:<person id>" in OAuth modes. */
   owner: string;
   createdAt: number;
 }

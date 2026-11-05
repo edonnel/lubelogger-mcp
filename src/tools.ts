@@ -20,10 +20,14 @@ type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean
 const ok = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
 const fail = (text: string): ToolResult => ({ isError: true, content: [{ type: "text", text }] });
 
-/** Who is calling: the signed-in person in OAuth modes, the single "token" identity otherwise. */
+/**
+ * Who is calling: the signed-in person as "<method>:<person id>" in OAuth modes, so the same id from two
+ * methods is never one owner, and the single "token" identity otherwise.
+ */
 export function ownerOf(extra: { authInfo?: { extra?: Record<string, unknown> } }): string {
+  const method = extra.authInfo?.extra?.method;
   const id = extra.authInfo?.extra?.personId;
-  return typeof id === "string" ? id : "token";
+  return typeof method === "string" && typeof id === "string" ? `${method}:${id}` : "token";
 }
 
 export async function guard(fn: () => Promise<string>): Promise<ToolResult> {

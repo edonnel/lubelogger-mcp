@@ -1,7 +1,8 @@
-// Builds the whole HTTP server for the configured AUTH_MODE. index.ts only loads the config and listens;
-// tests build it in-process with an injected login method and clock.
+// Builds the whole HTTP server for the configured sign-in methods, or token mode when there are none. index.ts only
+// loads the config and listens; tests build it in-process with injected login methods and clock.
 import { timingSafeEqual } from "node:crypto";
 import express, { type NextFunction, type Request, type RequestHandler, type Response } from "express";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { HomeAssistantLogin } from "./auth/homeassistant.js";
@@ -9,7 +10,7 @@ import type { LoginMethod } from "./auth/login-method.js";
 import { LoginProvider } from "./auth/provider.js";
 import { mountOAuth, plainErrorPage } from "./auth/routes.js";
 import { AuthStore } from "./auth/store.js";
-import type { Config } from "./config.js";
+import type { Config, MethodName } from "./config.js";
 import { LubeLoggerClient } from "./lubelogger.js";
 import { PendingStore } from "./pending.js";
 import { registerRecordTools } from "./records.js";
@@ -33,7 +34,8 @@ const INSTRUCTIONS = [
 /** The endpoint in every OAuth mode; config refuses a custom MCP_PATH there. */
 const OAUTH_ENDPOINT = "/mcp";
 
-export type AppDeps = { loginMethod?: LoginMethod; now?: () => number };
+/** `loginMethods` replaces the real implementation of any method it names; tests inject stubs. */
+export type AppDeps = { loginMethods?: Partial<Record<MethodName, LoginMethod>>; now?: () => number };
 
 export async function createApp(
   config: Config,
@@ -42,9 +44,14 @@ export async function createApp(
   const client = new LubeLoggerClient(config.LUBELOGGER_URL, config.LUBELOGGER_API_KEY, config.REQUEST_TIMEOUT_MS);
   const pending = new PendingStore(config.CONFIRM_TTL_MINUTES * 60_000);
 
-  function createServer(): McpServer {
+  // the LubeLogger client a verified request works with; every connection uses the shared key for now
+  function clientFor(_auth?: AuthInfo): LubeLoggerClient {
+    return client;
+  }
+
+  function createServer(lubelogger: LubeLoggerClient): McpServer {
     const server = new McpServer({ name: "lubelogger-mcp", version: "0.1.0" }, { instructions: INSTRUCTIONS });
-    const toolDeps = { client, pending, ttlMinutes: config.CONFIRM_TTL_MINUTES };
+    const toolDeps = { client: lubelogger, pending, ttlMinutes: config.CONFIRM_TTL_MINUTES };
     registerTools(server, toolDeps);
     registerReminderTools(server, toolDeps);
     registerRecordTools(server, toolDeps);
@@ -63,21 +70,17 @@ export async function createApp(
   let guard: RequestHandler;
   let close = async (): Promise<void> => {};
 
-  if (config.AUTH_MODE === "token") {
+  if (config.AUTH_METHODS.length === 0) {
     endpoint = config.MCP_PATH;
     guard = tokenGuard(config.MCP_AUTH_TOKEN);
-  } else if (config.AUTH_MODE === "homeassistant") {
+  } else {
     const publicUrl = config.PUBLIC_URL;
-    if (!publicUrl) throw new Error("PUBLIC_URL is required when AUTH_MODE is homeassistant");
-    if (!config.HOME_ASSISTANT_PUBLIC_URL || !config.HOME_ASSISTANT_URL)
-      throw new Error("HOME_ASSISTANT_PUBLIC_URL and HOME_ASSISTANT_URL are required when AUTH_MODE is homeassistant");
-    const method =
-      deps.loginMethod ??
-      new HomeAssistantLogin({
-        publicUrl,
-        haPublicUrl: config.HOME_ASSISTANT_PUBLIC_URL,
-        haUrl: config.HOME_ASSISTANT_URL,
-      });
+    if (!publicUrl) throw new Error("PUBLIC_URL is required when a sign-in method is on");
+
+    // in AUTH_METHODS order, which is the order of the buttons on the sign-in screen
+    const methods = new Map<MethodName, LoginMethod>();
+    for (const name of config.AUTH_METHODS)
+      methods.set(name, deps.loginMethods?.[name] ?? buildLoginMethod(name, config, publicUrl));
 
     // HA fetches its client ID (PUBLIC_URL + "/") to show the app's name and find its redirect URI
     const clientPage =
@@ -89,7 +92,7 @@ export async function createApp(
     });
 
     const store = await AuthStore.open(config.DATA_DIR, deps.now);
-    const provider = new LoginProvider(store, method, deps.now, {
+    const provider = new LoginProvider(store, methods, deps.now, {
       allowedRedirectHosts: config.ALLOWED_REDIRECT_HOSTS,
       publicUrl,
     });
@@ -98,13 +101,11 @@ export async function createApp(
     endpoint = OAUTH_ENDPOINT;
     guard = mountOAuth(app, { publicUrl, provider });
     close = () => provider.close();
-  } else {
-    throw new Error(`AUTH_MODE ${String(config.AUTH_MODE)} is not available in this version`);
   }
 
   // Stateless Streamable HTTP: a fresh server + transport per request. Pending confirmations live in process memory, so they survive across requests.
   app.post(endpoint, guard, express.json({ limit: "1mb" }), async (req, res) => {
-    const server = createServer();
+    const server = createServer(clientFor(req.auth));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       void transport.close();
@@ -127,10 +128,24 @@ export async function createApp(
   app.get(endpoint, guard, methodNotAllowed);
   app.delete(endpoint, guard, methodNotAllowed);
 
-  // OAuth modes serve browser pages, which must never show a stack trace; token mode is left as it was
-  if (config.AUTH_MODE !== "token") app.use(plainErrorPage);
+  // sign-in serves browser pages, which must never show a stack trace; token mode is left as it was
+  if (config.AUTH_METHODS.length > 0) app.use(plainErrorPage);
 
   return { app, close };
+}
+
+/** The real implementation of a sign-in method. Config has already refused any that is not available. */
+function buildLoginMethod(name: MethodName, config: Config, publicUrl: string): LoginMethod {
+  if (name === "homeassistant") {
+    if (!config.HOME_ASSISTANT_PUBLIC_URL || !config.HOME_ASSISTANT_URL)
+      throw new Error("HOME_ASSISTANT_PUBLIC_URL and HOME_ASSISTANT_URL are required for the homeassistant sign-in method");
+    return new HomeAssistantLogin({
+      publicUrl,
+      haPublicUrl: config.HOME_ASSISTANT_PUBLIC_URL,
+      haUrl: config.HOME_ASSISTANT_URL,
+    });
+  }
+  throw new Error(`sign-in method ${name} is not available in this version`);
 }
 
 function escapeAttr(s: string): string {

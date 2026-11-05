@@ -8,9 +8,13 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { WebSocketServer } from "ws";
 import { createApp } from "../dist/app.js";
+import { LoginProvider } from "../dist/auth/provider.js";
+import { AuthStore, hashToken } from "../dist/auth/store.js";
 import { validateConfig } from "../dist/config.js";
+import { PendingStore } from "../dist/pending.js";
 
 const PUBLIC_URL = "https://mcp.example.com";
 const API_KEY = "test-api-key";
@@ -120,7 +124,7 @@ function config(over = {}) {
 
 let running;
 async function start() {
-  const built = await createApp(config(), { loginMethod: stub, now });
+  const built = await createApp(config(), { loginMethods: { homeassistant: stub }, now });
   const server = await new Promise((resolve) => {
     const s = built.app.listen(0, "127.0.0.1", () => resolve(s));
   });
@@ -174,8 +178,9 @@ const cookieOf = (response) => {
   return set.split(";")[0];
 };
 
-const approve = (loginState, cookie, headers = {}) =>
-  form("/login", { loginState }, { ...(cookie ? { cookie } : {}), ...headers });
+// pressing a sign-in method's button on the sign-in screen
+const approve = (loginState, cookie, headers = {}, method = "homeassistant") =>
+  form("/login", { loginState, method }, { ...(cookie ? { cookie } : {}), ...headers });
 
 // the login method's return to /login/callback, from the browser that holds the cookie
 const callBack = (begun) => get(begun.callback, { headers: { cookie: begun.cookie } });
@@ -375,6 +380,8 @@ await check("/authorize shows an approval page naming the app and where it retur
   assert.doesNotMatch(html, /<b>Sneaky/);
   assert.match(html, /claude\.example\.com/);
   assert.match(html, /<form method="post" action="\/login">/);
+  assert.match(html, /<button type="submit" name="method" value="homeassistant">/);
+  assert.match(html, /Continue with Home Assistant/);
 
   const unnamed = await register({ client_name: undefined });
   assert.match((await openApproval(unnamed, "alice")).html, /An unnamed app/);
@@ -456,6 +463,54 @@ await check("a malformed or oversize approval body gets a plain page with no sta
     assert.doesNotMatch(page, /Error/, `${why}: no error name`);
     assert.ok(!page.includes(marker), `${why}: no request content`);
   }
+});
+
+await check("the sign-in screen names the app, its return host, and one button per method", async () => {
+  const claude = await register({ client_name: "Claude <b>x</b>" });
+  const { html, response } = await openApproval(claude, "alice");
+  assert.match(html, /Sign in to LubeLogger MCP/);
+  assert.match(html, /Claude &lt;b&gt;x&lt;\/b&gt;/);
+  assert.match(html, /claude\.example\.com/);
+  assert.equal((html.match(/name="method"/g) ?? []).length, 1);
+  assert.equal(response.headers.get("content-security-policy"), "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'");
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.doesNotMatch(html, /<script/i);
+});
+
+await check("a method that is not on, or no method, gets a 400 page, keeps the state, and is logged quoted", async () => {
+  const claude = await register();
+  const { loginState, cookie } = await openApproval(claude, "alice");
+  for (const method of ["oidc", "", "evil\nline"]) {
+    const r = await approve(loginState, cookie, {}, method);
+    assert.equal(r.status, 400);
+    assert.match(await r.text(), /not available/);
+  }
+  // a form with no method field at all, such as a release 1 approval page still open in a tab
+  const bare = await form("/login", { loginState }, { cookie });
+  assert.equal(bare.status, 400);
+  assert.match(await bare.text(), /not available/);
+  assert.ok(logs.some((l) => l.includes(JSON.stringify("evil\nline"))));
+  assert.ok(!logs.some((l) => l.includes("evil\nline") && !l.includes(JSON.stringify("evil\nline"))));
+  const ok = await approve(loginState, cookie);
+  assert.equal(ok.status, 302);
+});
+
+await check("pressing the button twice does not break the login under way", async () => {
+  const claude = await register();
+  const { loginState, cookie, verifier } = await openApproval(claude, "alice");
+  const first = await approve(loginState, cookie);
+  assert.equal(first.status, 302);
+  const second = await approve(loginState, cookie);
+  assert.equal(second.status, 400);
+  assert.match(await second.text(), /This login link has expired, start again from Claude/);
+  const back = await get(first.headers.get("location"), { headers: { cookie } });
+  assert.equal(back.status, 302);
+  // and the code from that callback still exchanges for tokens
+  const code = new URL(back.headers.get("location")).searchParams.get("code");
+  secrets.add(code);
+  const r = await exchange(claude, code, verifier);
+  assert.equal(r.status, 200);
+  remember(await r.json());
 });
 
 await check("refresh rotates the token; the old one works only within 60 seconds and gives the same pair", async () => {
@@ -648,6 +703,28 @@ await check("a confirmation proposed by alice cannot be committed by carol", asy
   await asCarol.close();
 });
 
+await check("confirmations are owned by method and person", async () => {
+  // the app's own PendingStore, watched through its prototype
+  const owners = [];
+  const add = PendingStore.prototype.add;
+  PendingStore.prototype.add = function (rec) {
+    owners.push(rec.owner);
+    return add.call(this, rec);
+  };
+  try {
+    const asAlice = await mcpClient(alice.access_token);
+    const preview = await asAlice.callTool({
+      name: "propose_odometer_record",
+      arguments: { vehicle: "Tacoma", date: "2026-11-02", odometer: 1300 },
+    });
+    assert.ok(!preview.isError, text(preview));
+    await asAlice.close();
+  } finally {
+    PendingStore.prototype.add = add;
+  }
+  assert.deepEqual(owners, ["homeassistant:id-alice"]);
+});
+
 await check("connections survive a restart", async () => {
   await stop();
   await start();
@@ -656,6 +733,26 @@ await check("connections survive a restart", async () => {
   assert.equal(r.status, 200);
   alice = remember(await r.json());
   assert.equal(await mcpStatus(alice.access_token), 200);
+});
+
+await check("a release 1 connection refreshes without a new login", async () => {
+  const client = await register();
+  const tokens = await login(client, "carol");
+  await stop();
+  // write oauth.json as release 1 did: no connection records its method
+  const file = path.join(dataDir, "oauth.json");
+  const data = JSON.parse(await fs.readFile(file, "utf8"));
+  for (const c of Object.values(data.connections)) delete c.method;
+  await fs.writeFile(file, JSON.stringify(data, null, 2));
+  await start();
+  const r = await refresh(client, tokens.refresh_token);
+  assert.equal(r.status, 200);
+  const next = remember(await r.json());
+  assert.equal(await mcpStatus(next.access_token), 200);
+  // the next write records the method on every connection
+  const stored = Object.values(JSON.parse(await fs.readFile(file, "utf8")).connections);
+  assert.ok(stored.length > 0);
+  for (const c of stored) assert.equal(c.method, "homeassistant");
 });
 
 await check("a connection unused for 90 days expires", async () => {
@@ -700,6 +797,49 @@ await check("expired connections are purged by the periodic sweep", async () => 
 await check("refresh tokens are stored hashed", async () => {
   const raw = await fs.readFile(path.join(dataDir, "oauth.json"), "utf8");
   for (const s of secrets) assert.ok(!raw.includes(s), "no issued secret in the data file");
+});
+
+await check("a connection whose method is switched off is ended at refresh, and its cleanup is skipped with a log line", async () => {
+  const offDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-off-"));
+  try {
+    const store = await AuthStore.open(offDir, now);
+    const client = { client_id: "client-off", redirect_uris: [REDIRECT_URI] };
+    const refreshToken = randomBytes(32).toString("base64url");
+    secrets.add(refreshToken);
+    const connection = (id, name, hash) => ({
+      id,
+      clientId: client.client_id,
+      method: "homeassistant",
+      person: { id: `id-${name}`, name },
+      upstream: { session: `up-${name}-off`, name },
+      refreshHash: hash,
+      lastUsedAt: clock,
+    });
+    await store.putConnection(connection("conn-bob", "bob", hashToken(refreshToken)));
+    await store.putConnection(connection("conn-carol", "carol", hashToken(randomBytes(32).toString("base64url"))));
+
+    // another method's stub: it must never be asked about a homeassistant connection
+    const other = { ...stub, cleaned: [] };
+    assert.throws(() => new LoginProvider(store, new Map(), now), "a provider needs at least one method");
+    const provider = new LoginProvider(store, new Map([["oidc", other]]), now);
+    const before = stub.cleaned.length;
+
+    await assert.rejects(provider.exchangeRefreshToken(client, refreshToken), InvalidGrantError);
+    assert.ok(!store.connections().some((c) => c.id === "conn-bob"), "the connection is gone");
+    assert.ok(logs.some((l) => l.includes('upstream session for "bob" could not be revoked (sign-in method switched off)')));
+    assert.ok(logs.some((l) => l.includes('disconnected "bob" (sign-in method switched off)')));
+
+    // the purge ends the ones that are never presented again
+    await provider.purgeExpired();
+    assert.deepEqual(store.connections(), []);
+    assert.ok(logs.some((l) => l.includes('upstream session for "carol" could not be revoked (sign-in method switched off)')));
+
+    assert.equal(stub.cleaned.length, before, "no cleanup ran through any method");
+    assert.deepEqual(other.cleaned, []);
+    await provider.close();
+  } finally {
+    await fs.rm(offDir, { recursive: true, force: true });
+  }
 });
 
 await check("logins are logged by name, never with a token or code", async () => {

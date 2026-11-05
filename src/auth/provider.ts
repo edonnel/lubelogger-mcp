@@ -17,7 +17,9 @@ import type {
   OAuthTokenRevocationRequest,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
+import type { MethodName } from "../config.js";
 import type { LoginMethod, RecheckResult } from "./login-method.js";
+import { BUTTON_LABEL, escapeHtml, PAGE_HEADERS, signInPage } from "./signin-page.js";
 import { hashToken, REFRESH_GRACE_MS, type AuthStore, type Connection, type Person } from "./store.js";
 
 export const ACCESS_TOKEN_TTL_MS = 60 * 60_000;
@@ -26,7 +28,7 @@ export const CODE_TTL_MS = 10 * 60_000;
 /** How often connections unused for 90 days are looked for and removed. */
 export const PURGE_INTERVAL_MS = 60 * 60_000;
 
-/** Binds a login to the browser that saw the approval page. Path=/login covers /login and /login/callback. */
+/** Binds a login to the browser that saw the sign-in screen. Path=/login covers /login and /login/callback. */
 const LOGIN_COOKIE = "lm_login";
 const COOKIE_ATTRIBUTES = "HttpOnly; Secure; SameSite=Lax; Path=/login";
 
@@ -34,29 +36,33 @@ const EXPIRED_LINK = "This login link has expired, start again from Claude.";
 
 const EXPIRED_UNUSED = "expired after 90 days unused";
 
+const METHOD_OFF = "sign-in method switched off";
+
 export const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com"];
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
-// approved: the person pressed Approve on our page; only then is the login method's answer accepted.
-// browserHash: the SHA-256 of the nonce in the approval page's cookie, which approval and callback must present.
+// method: the one the person chose on the sign-in screen. Only then is a login method's answer accepted, and only
+// that method's. browserHash: the SHA-256 of the nonce in the sign-in screen's cookie, which choosing and callback
+// must present.
 type LoginState = {
   clientId: string;
   params: AuthorizationParams;
   createdAt: number;
-  approved: boolean;
+  method?: MethodName;
   browserHash: string;
 };
 
 type PendingCode = {
   clientId: string;
   params: AuthorizationParams;
+  method: MethodName;
   person: Person;
   upstream: Record<string, unknown>;
   createdAt: number;
 };
 
-type AccessGrant = { connectionId: string; clientId: string; person: Person; expiresAt: number };
+type AccessGrant = { connectionId: string; clientId: string; method: MethodName; person: Person; expiresAt: number };
 
 // the pair a rotation issued, kept so a retry with the previous refresh token gets the same answer
 type RecentRotation = { refreshHash: string; tokens: OAuthTokens; rotatedAt: number };
@@ -72,22 +78,11 @@ function who(person: Person | undefined): string {
   return JSON.stringify(person?.name ?? "unknown");
 }
 
-const HTML_ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" };
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch] ?? ch);
-}
-
 /** Sends a small page. `body` is trusted HTML: escape anything interpolated into it. */
 function sendPage(res: express.Response, status: number, title: string, body: string): void {
   res
     .status(status)
-    .set({
-      "Cache-Control": "no-store",
-      // never inside a frame, so the Approve button cannot be clickjacked
-      "X-Frame-Options": "DENY",
-      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
-    })
+    .set(PAGE_HEADERS)
     .type("html")
     .send(
       "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">" +
@@ -151,7 +146,7 @@ export class LoginProvider implements OAuthServerProvider {
 
   private readonly allowedRedirectHosts: readonly string[];
 
-  // the origin a browser posting the approval form reports, when it reports one
+  // the origin a browser posting the sign-in form reports, when it reports one
   private readonly publicOrigin: string | undefined;
 
   private lastPurge: number;
@@ -162,10 +157,11 @@ export class LoginProvider implements OAuthServerProvider {
 
   constructor(
     private readonly store: AuthStore,
-    private readonly method: LoginMethod,
+    private readonly methods: ReadonlyMap<MethodName, LoginMethod>,
     private readonly now: () => number = Date.now,
     opts: { allowedRedirectHosts?: readonly string[]; publicUrl?: string } = {},
   ) {
+    if (methods.size === 0) throw new Error("at least one sign-in method is required");
     this.allowedRedirectHosts = opts.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS;
     this.publicOrigin = opts.publicUrl ? new URL(opts.publicUrl).origin : undefined;
     this.lastPurge = this.now();
@@ -200,7 +196,6 @@ export class LoginProvider implements OAuthServerProvider {
       clientId: client.client_id,
       params,
       createdAt: this.now(),
-      approved: false,
       browserHash: hashToken(nonce),
     });
     res.append(
@@ -209,41 +204,47 @@ export class LoginProvider implements OAuthServerProvider {
     );
 
     const name = client.client_name?.trim() ? client.client_name.trim() : "An unnamed app";
-    sendPage(
-      res,
-      200,
-      "Connect to LubeLogger MCP?",
-      `<p><strong>${escapeHtml(name)}</strong> wants to connect to LubeLogger MCP and will return to ` +
-        `<strong>${escapeHtml(host)}</strong>.</p>` +
-        "<p>Only continue if you started this from Claude.</p>" +
-        "<form method=\"post\" action=\"/login\">" +
-        `<input type="hidden" name="loginState" value="${escapeHtml(loginState)}">` +
-        "<button type=\"submit\">Approve</button></form>",
-    );
+    // one button per method, in the order the methods were configured
+    const choices = [...this.methods.keys()].map((method) => ({ method, label: BUTTON_LABEL[method] }));
+    res
+      .status(200)
+      .set(PAGE_HEADERS)
+      .type("html")
+      .send(signInPage({ appName: name, returnHost: host, loginState, choices }));
   }
 
-  /** POST /login: the person pressed Approve on the page `authorize` showed. Never throws. */
-  async handleApprove(req: express.Request, res: express.Response): Promise<void> {
+  /** POST /login: the person pressed a method's button on the screen `authorize` showed. Never throws. */
+  async handleChoose(req: express.Request, res: express.Response): Promise<void> {
     try {
       this.sweep();
       const body = (req.body ?? {}) as Record<string, unknown>;
       const loginState = typeof body.loginState === "string" ? body.loginState : "";
       const entry = this.states.get(loginState);
-      // approval is single use too: a second press, or an expired state, has to start again
-      if (!entry || entry.approved || this.now() - entry.createdAt > LOGIN_STATE_TTL_MS) {
-        if (entry) this.states.delete(loginState);
+      // choosing is single use: once a method is chosen the state only finishes through it, so a second press
+      // (Back, then press again) has to start again. That state is kept, so the login under way still finishes
+      const expired = entry !== undefined && this.now() - entry.createdAt > LOGIN_STATE_TTL_MS;
+      if (!entry || expired || entry.method !== undefined) {
+        if (expired) this.states.delete(loginState);
         page(res, 400, "Login expired", EXPIRED_LINK);
         return;
       }
-      // only the browser that was shown the approval page may press Approve: a form posted from another
+      // only the browser that was shown the sign-in screen may choose: a form posted from another
       // site carries a foreign Origin, or no login cookie. The state is kept, so the real page still works
       const origin = req.headers.origin;
       if ((origin !== undefined && origin !== this.publicOrigin) || !sameBrowser(req, entry.browserHash)) {
         page(res, 400, "Login expired", EXPIRED_LINK);
         return;
       }
-      entry.approved = true;
-      await this.method.start(loginState, res);
+      // a method that is off, or no method at all (a release 1 page still open in a tab); the state is kept
+      const value = body.method;
+      const method = typeof value === "string" ? this.methods.get(value as MethodName) : undefined;
+      if (!method) {
+        log(`sign-in with unavailable method ${JSON.stringify(String(value ?? "").slice(0, 40))} refused`);
+        page(res, 400, "Not available", "That sign-in method is not available on this server.");
+        return;
+      }
+      entry.method = value as MethodName;
+      await method.start(loginState, res);
     } catch (err) {
       log(`login could not be started: ${err instanceof Error ? err.message : "unknown error"}`);
       if (!res.headersSent) page(res, 502, "Login failed", "The login could not be started. Start again from Claude.");
@@ -259,9 +260,12 @@ export class LoginProvider implements OAuthServerProvider {
       // single use: gone before the login method is even asked, and the browser's cookie with it
       if (entry) this.states.delete(loginState);
       clearLoginCookie(res);
+      // only through the method chosen on the sign-in screen
+      const method = entry?.method !== undefined ? this.methods.get(entry.method) : undefined;
       if (
         !entry ||
-        !entry.approved ||
+        entry.method === undefined ||
+        !method ||
         this.now() - entry.createdAt > LOGIN_STATE_TTL_MS ||
         !sameBrowser(req, entry.browserHash)
       ) {
@@ -271,7 +275,7 @@ export class LoginProvider implements OAuthServerProvider {
 
       let result: Awaited<ReturnType<LoginMethod["finish"]>>;
       try {
-        result = await this.method.finish(req);
+        result = await method.finish(req);
       } catch (err) {
         log(`login could not be completed: ${err instanceof Error ? err.message : "unknown error"}`);
         page(res, 502, "Login failed", "The login could not be completed. Start again from Claude.");
@@ -288,6 +292,7 @@ export class LoginProvider implements OAuthServerProvider {
       this.codes.set(hashToken(code), {
         clientId: entry.clientId,
         params: entry.params,
+        method: entry.method,
         person: result.person,
         upstream: result.upstream,
         createdAt: this.now(),
@@ -319,15 +324,14 @@ export class LoginProvider implements OAuthServerProvider {
     this.codes.delete(hashToken(authorizationCode));
 
     if (redirectUri !== undefined && redirectUri !== entry.params.redirectUri) {
-      await this.safeCleanup(entry.upstream, entry.person);
+      await this.safeCleanup(entry.upstream, entry.person, entry.method);
       throw new InvalidGrantError("redirect_uri does not match the authorization request");
     }
 
     const refreshToken = newSecret();
     const connection: Connection = {
       id: randomUUID(),
-      // stopgap until the chooser records the real method
-      method: "homeassistant",
+      method: entry.method,
       clientId: client.client_id,
       person: entry.person,
       upstream: entry.upstream,
@@ -338,7 +342,7 @@ export class LoginProvider implements OAuthServerProvider {
     const replaced = await this.store.putConnection(connection);
     if (replaced) {
       this.forget(replaced.id);
-      await this.safeCleanup(replaced.upstream, replaced.person);
+      await this.safeCleanup(replaced.upstream, replaced.person, replaced.method);
       log(`connection for ${who(replaced.person)} replaced by a new login`);
     }
 
@@ -367,6 +371,13 @@ export class LoginProvider implements OAuthServerProvider {
       throw new InvalidGrantError("Refresh token expired");
     }
 
+    // a method switched off is a definite refusal: the connection ends, and Claude asks the person to sign in again
+    const method = this.methods.get(connection.method);
+    if (!method) {
+      await this.end(connection, METHOD_OFF);
+      throw new InvalidGrantError("Access was withdrawn");
+    }
+
     if (stale) {
       // a retry of a refresh that already rotated: hand back the very same pair
       const recent = this.recent.get(connection.id);
@@ -377,7 +388,7 @@ export class LoginProvider implements OAuthServerProvider {
 
     let check: RecheckResult;
     try {
-      check = await this.method.recheck(connection.upstream);
+      check = await method.recheck(connection.upstream);
     } catch (err) {
       check = { ok: false, reason: "unavailable" };
       log(`re-check for ${who(connection.person)} failed: ${err instanceof Error ? err.message : "unknown error"}`);
@@ -428,7 +439,7 @@ export class LoginProvider implements OAuthServerProvider {
       clientId: grant.clientId,
       scopes: [],
       expiresAt: Math.floor(grant.expiresAt / 1000),
-      extra: { personId: grant.person.id, personName: grant.person.name },
+      extra: { method: grant.method, personId: grant.person.id, personName: grant.person.name },
     };
   }
 
@@ -445,7 +456,8 @@ export class LoginProvider implements OAuthServerProvider {
   }
 
   /**
-   * Removes every connection unused for 90 days and ends its upstream session. A connection Claude abandoned
+   * Removes every connection unused for 90 days, or made by a method that is now switched off, and ends its
+   * upstream session where it can. A connection Claude abandoned
    * (say, after the connector was added again under a new client) is never presented again, so checking
    * on refresh alone would keep its upstream session forever.
    */
@@ -460,8 +472,10 @@ export class LoginProvider implements OAuthServerProvider {
 
   private async purgeOnce(): Promise<void> {
     try {
-      for (const connection of this.store.connections())
+      for (const connection of this.store.connections()) {
         if (this.store.expired(connection)) await this.end(connection, EXPIRED_UNUSED);
+        else if (!this.methods.has(connection.method)) await this.end(connection, METHOD_OFF);
+      }
     } catch (err) {
       log(`purging expired connections failed: ${err instanceof Error ? err.message : "unknown error"}`);
     }
@@ -482,7 +496,7 @@ export class LoginProvider implements OAuthServerProvider {
     const pending = [...this.codes.values()];
     this.codes.clear();
     this.states.clear();
-    await Promise.all(pending.map((c) => this.safeCleanup(c.upstream, c.person)));
+    await Promise.all(pending.map((c) => this.safeCleanup(c.upstream, c.person, c.method)));
   }
 
   private liveCode(client: OAuthClientInformationFull, code: string): PendingCode {
@@ -498,6 +512,7 @@ export class LoginProvider implements OAuthServerProvider {
     this.access.set(hashToken(accessToken), {
       connectionId: connection.id,
       clientId: connection.clientId,
+      method: connection.method,
       person: connection.person,
       expiresAt: this.now() + ACCESS_TOKEN_TTL_MS,
     });
@@ -514,7 +529,7 @@ export class LoginProvider implements OAuthServerProvider {
     const removed = await this.store.removeConnection(connection.id);
     if (!removed) return;
     this.forget(connection.id);
-    await this.safeCleanup(connection.upstream, connection.person);
+    await this.safeCleanup(connection.upstream, connection.person, connection.method);
     log(`disconnected ${who(connection.person)} (${why})`);
   }
 
@@ -523,9 +538,15 @@ export class LoginProvider implements OAuthServerProvider {
     for (const [key, grant] of this.access) if (grant.connectionId === connectionId) this.access.delete(key);
   }
 
-  private async safeCleanup(upstream: Record<string, unknown>, person: Person): Promise<void> {
+  /** Ends an upstream session through the method that made it. Best effort when that method is switched off. */
+  private async safeCleanup(upstream: Record<string, unknown>, person: Person, method: MethodName): Promise<void> {
+    const login = this.methods.get(method);
+    if (!login) {
+      log(`upstream session for ${who(person)} could not be revoked (${METHOD_OFF})`);
+      return;
+    }
     try {
-      await this.method.cleanup(upstream);
+      await login.cleanup(upstream);
     } catch (err) {
       log(`cleanup for ${who(person)} failed: ${err instanceof Error ? err.message : "unknown error"}`);
     }
@@ -537,7 +558,7 @@ export class LoginProvider implements OAuthServerProvider {
     for (const [key, c] of this.codes) {
       if (t - c.createdAt > CODE_TTL_MS) {
         this.codes.delete(key);
-        void this.safeCleanup(c.upstream, c.person);
+        void this.safeCleanup(c.upstream, c.person, c.method);
       }
     }
     for (const [key, g] of this.access) if (g.expiresAt <= t) this.access.delete(key);

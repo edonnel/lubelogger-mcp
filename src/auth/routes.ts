@@ -59,7 +59,7 @@ export function mountOAuth(
       clientRegistrationOptions: { clientSecretExpirySeconds: 0 },
     }),
   );
-  app.post("/login", express.urlencoded({ extended: false, limit: "4kb" }), (req, res) => provider.handleApprove(req, res));
+  app.post("/login", express.urlencoded({ extended: false, limit: "4kb" }), (req, res) => provider.handleChoose(req, res));
   app.get("/login/callback", (req, res) => provider.handleCallback(req, res));
 
   return requireBearerAuth({
