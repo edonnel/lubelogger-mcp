@@ -19,7 +19,7 @@ import type {
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { MethodName } from "../config.js";
 import type { LoginMethod, RecheckResult } from "./login-method.js";
-import { BUTTON_LABEL, escapeHtml, PAGE_HEADERS, signInPage } from "./signin-page.js";
+import { BUTTON_LABEL, escapeHtml, PAGE_HEADERS, pageShell, signInPage } from "./signin-page.js";
 import { hashToken, REFRESH_GRACE_MS, type AuthStore, type Connection, type Person } from "./store.js";
 
 export const ACCESS_TOKEN_TTL_MS = 60 * 60_000;
@@ -84,16 +84,11 @@ function sendPage(res: express.Response, status: number, title: string, body: st
     .status(status)
     .set(PAGE_HEADERS)
     .type("html")
-    .send(
-      "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">" +
-        `<title>${escapeHtml(title)}</title></head>` +
-        `<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">` +
-        `<h1>${escapeHtml(title)}</h1>${body}</body></html>`,
-    );
+    .send(pageShell(title, body));
 }
 
 export function page(res: express.Response, status: number, title: string, message: string): void {
-  sendPage(res, status, title, `<p>${escapeHtml(message)}</p>`);
+  sendPage(res, status, title, `<div class="box"><p>${escapeHtml(message)}</p></div>`);
 }
 
 /** The hostname of an allowed redirect URI, or undefined: https to a listed host, or http to a listed loopback host. */

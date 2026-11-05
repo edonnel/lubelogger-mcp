@@ -382,6 +382,17 @@ await check("/authorize shows an approval page naming the app and where it retur
   assert.match(html, /<form method="post" action="\/login">/);
   assert.match(html, /<button type="submit" name="method" value="homeassistant">/);
   assert.match(html, /Continue with Home Assistant/);
+  // the design's look: the wrench mark, the request box, and the method's icon inside its button
+  assert.match(html, /<div class="logo" aria-hidden="true"><svg/);
+  assert.match(html, /wants access to your vehicle records and will return to/);
+  assert.match(html, /value="homeassistant"><svg[^>]*aria-hidden="true">[\s\S]*?<\/svg>Continue with Home Assistant<\/button>/);
+  assert.match(html, /prefers-color-scheme: dark/);
+  assert.doesNotMatch(html, /<script|<link|@import|url\(/i);
+
+  // pages along the way share that look
+  const expired = await approve("no-such-state", "lm_login=x");
+  assert.equal(expired.status, 400);
+  assert.match(await expired.text(), /<div class="logo"[\s\S]*<h1>Login expired<\/h1><div class="box">/);
 
   const unnamed = await register({ client_name: undefined });
   assert.match((await openApproval(unnamed, "alice")).html, /An unnamed app/);
