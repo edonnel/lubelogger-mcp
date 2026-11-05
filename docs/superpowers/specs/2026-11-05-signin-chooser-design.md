@@ -102,6 +102,8 @@ This replaces the approved design's three releases. Each step can be tested and 
   - a release 1 data file loading unchanged;
   - `launch.mjs` failing clearly, without printing values, for each missing setting.
 
+**Step 3 done:** the LubeLogger password and API key methods, built from `docs/superpowers/plans/2026-11-05-signin-chooser-step-3-lubelogger.md`, and documented in the README.
+
 ## Carried into step 2 (from step 1's final review)
 
 - **Done. Revoke a switched-off method's upstream sessions when its settings are still present.** Step 1 only revokes through methods that are on. With a single method there was nothing to reach, since removing it returns the server to token mode. Step 2 adds a second method, so it has to build the switched-off method from its remaining settings for cleanup, as "Connections" above describes. Covered by `a switched-off method that is still configured has its upstream session revoked` in `test/oauth-ha.mjs`.

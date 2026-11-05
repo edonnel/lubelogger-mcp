@@ -13,6 +13,7 @@ Every request it sends was checked against the LubeLogger 1.7.4 source: routes, 
 - **Patched dependencies**, lockfile only: `body-parser` 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), denial of service) and `fast-uri` 3.1.9 ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) and related).
 - **Sign in with Home Assistant (OAuth).** With `AUTH_METHODS=homeassistant`, the Claude app connects through a plain `https://<host>/mcp` URL and a Home Assistant login instead of a secret path. `AUTH_METHODS` is a list of sign-in methods, so more can be added alongside it; `AUTH_MODE=homeassistant` still works and means the same thing. Only Home Assistant admins (`is_admin`) can connect. See [Sign in with Home Assistant](#sign-in-with-home-assistant-oauth). With neither set, `AUTH_MODE` defaults to `token`, the behaviour above.
 - **Sign in with OpenID Connect.** Add `oidc` to `AUTH_METHODS` to let people sign in with any standard OpenID Connect provider (Google, Authentik, Keycloak and so on). It can run alongside Home Assistant, as a second button on the same sign-in screen. See [Sign in with OpenID Connect](#sign-in-with-openid-connect).
+- **Sign in with LubeLogger.** Add `lubelogger-password` and/or `lubelogger-key` to `AUTH_METHODS` to let people sign in with their LubeLogger username and password, or with their own LubeLogger API key. They share the sign-in screen with the other methods. See [Sign in with LubeLogger](#sign-in-with-lubelogger).
 - Tests for all of the above in `test/smoke.mjs`, and a `.gitattributes` that keeps line endings LF.
 - **Follows LubeLogger's "Odometer Optional" setting.** Service, repair, upgrade and fuel records for those vehicles can leave the odometer out; it is saved as 0, which LubeLogger shows as a blank odometer, matching its own form. `list_vehicles` marks these vehicles, and Claude treats the reading as a suggestion for them. Upstream required it for every vehicle.
 - **Edits existing records.** `list_records` finds them and `propose_record_update` changes only the fields given, through the same preview-and-confirm flow. LubeLogger's update endpoints overwrite every field, so the update starts from the full record and keeps attachments, extra fields and fuel charge levels. Upstream was add-only.
@@ -103,16 +104,17 @@ cp .env.example .env
 | Variable | Default | Notes |
 |---|---|---|
 | `LUBELOGGER_URL` | required | Address of LubeLogger as seen from this container, e.g. `http://lubelogger:8080` |
-| `LUBELOGGER_API_KEY` | required | Sent as the `x-api-key` header |
+| `LUBELOGGER_API_KEY` | required | Sent as the `x-api-key` header. Optional only when `lubelogger-key` is the only method in `AUTH_METHODS`, because every connection then uses its owner's own key |
 | `MCP_AUTH_TOKEN` | unset | If set, every MCP request needs `Authorization: Bearer <token>`. If unset, `MCP_PATH` must hold a secret segment or the server will not start |
 | `MCP_PATH` | `/mcp` | Without `MCP_AUTH_TOKEN`, must contain a random segment of at least 32 characters, e.g. `/mcp/<output of: openssl rand -hex 16>`. A custom path is never printed in the log |
-| `AUTH_METHODS` | unset | Comma-separated sign-in methods for OAuth: `homeassistant`, `oidc`, `lubelogger-password` and `lubelogger-key`. `homeassistant` and `oidc` are available in this version, and both can be on at once; `lubelogger-password` and `lubelogger-key` refuse to start with "is not available in this version". Never set it together with a non-token `AUTH_MODE` |
+| `AUTH_METHODS` | unset | Comma-separated sign-in methods for OAuth: `homeassistant`, `oidc`, `lubelogger-password` and `lubelogger-key`. Any of them can be on together, and the sign-in screen offers each one. Never set it together with a non-token `AUTH_MODE` |
 | `AUTH_MODE` | `token` | `token` is the bearer token or secret path above. `homeassistant` still works and means `AUTH_METHODS=homeassistant`. Setting `AUTH_METHODS` together with a non-token `AUTH_MODE` refuses to start |
 | `PUBLIC_URL` | unset | Required when a sign-in method is on. This server's public address, origin only with no path, e.g. `https://mcp.example.com` |
 | `HOME_ASSISTANT_PUBLIC_URL` | unset | Home Assistant mode only, required. Home Assistant's address as your browser sees it, no path, e.g. `https://ha.example.com` |
 | `HOME_ASSISTANT_URL` | unset | Home Assistant mode only, required. Home Assistant's address as this server reaches it, no path, e.g. `http://homeassistant:8123` inside the add-on network |
 | `DATA_DIR` | `./data` | Sign-in modes. Holds `oauth.json` with the registered clients and connections. Keep it private and back it up |
 | `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | Sign-in modes. Hosts a login code may be sent back to, comma-separated bare hostnames with no scheme or port. Only these hosts can register as clients. Add `localhost,127.0.0.1` for Claude Code |
+| `LUBELOGGER_ALLOWED_USERS` | unset | Comma-separated LubeLogger usernames that may sign in with `lubelogger-password`. Required when that method is on. See [Sign in with LubeLogger](#sign-in-with-lubelogger) |
 | `OIDC_*` | see below | The OpenID Connect settings, listed under [Sign in with OpenID Connect](#sign-in-with-openid-connect) |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | |
 | `CONFIRM_TTL_MINUTES` | `30` | How long a preview token stays valid |
@@ -255,6 +257,44 @@ Each refresh checks the allowlist again against the new ID token, so removing so
 **Disconnect.** When a connection ends, the server revokes its refresh token at the provider, if the provider has a revocation endpoint. Without one, end the session at the provider.
 
 **In the Home Assistant add-on.** Tick the **oidc** checkbox (it is off by default) and fill in the `oidc_*` options, which match the variables above: `oidc_issuer`, `oidc_client_id`, `oidc_client_secret`, `oidc_display_name`, `oidc_allowed_emails`, `oidc_allowed_subjects`, `oidc_required_group`, `oidc_groups_claim` and `oidc_auth_params`. The add-on will not start while the checkbox is on and the issuer, the client id or all three allowlist options are missing; it names the option in the log without printing values.
+
+## Sign in with LubeLogger
+
+Two more methods let people sign in with LubeLogger itself, with no Home Assistant or identity provider needed. Add either or both to `AUTH_METHODS`:
+
+- `lubelogger-password`: the person types their LubeLogger username and password.
+- `lubelogger-key`: the person pastes their own LubeLogger API key.
+
+```
+AUTH_METHODS=lubelogger-password,lubelogger-key
+PUBLIC_URL=https://mcp.example.com
+LUBELOGGER_ALLOWED_USERS=alice,bob
+```
+
+On the sign-in screen the password form comes after any buttons for the other methods. When the key method is on too, it sits under the password form behind "Use a LubeLogger API key instead"; on its own it is shown directly.
+
+**LubeLogger's own login must be on.** If LubeLogger runs with its login switched off, every attempt is refused, because there is no way to tell who is signing in.
+
+**Who may sign in.**
+
+- **Password:** `LUBELOGGER_ALLOWED_USERS` is required when `lubelogger-password` is on, and the server refuses to start without it. A person is the username LubeLogger reports for them, not what they typed. Every refresh checks the list again, so removing someone disconnects them at their next refresh.
+- **API key:** there is no list. Anyone with a valid LubeLogger API key can connect, so hand out keys with that in mind.
+
+**Whose permissions it uses.** A connection made with an API key acts with that person's own LubeLogger permissions: every LubeLogger call it makes uses their key. A connection made with a password uses the shared `LUBELOGGER_API_KEY`, like the other methods.
+
+**Ending a connection.**
+
+- **API key:** deleting the key in LubeLogger ends the connection at its next refresh.
+- **Password:** changing the person's password does not end the connection, because the server never stores it. Take the person out of `LUBELOGGER_ALLOWED_USERS`.
+- Ending a connection never deletes anyone's key in LubeLogger.
+
+**Passwords with a colon can't sign in.** LubeLogger's API checks a password through basic authentication, which cannot carry a `:` in the username or the password. A person whose password has one needs another method, or a new password.
+
+**Too many attempts.** 5 failed sign-ins within 15 minutes lock the address they came from for 15 minutes. On the password form the username is locked too, so spreading guesses over many addresses doesn't help. Attempts still being checked count as failures until they finish. Correct credentials for someone who is not on the allowlist don't count as failures, and are still refused. A locked-out person sees "Too many attempts" and can try again when the time is up.
+
+**`LUBELOGGER_API_KEY` when only the key method is on.** With `lubelogger-key` as the only method, nobody uses the shared key, so `LUBELOGGER_API_KEY` may be left out. With any other method on, it is still required.
+
+**In the Home Assistant add-on.** Tick the **lubelogger_password** and/or **lubelogger_key** checkboxes (both are off by default). For passwords, fill in `lubelogger_allowed_users`. `lubelogger_api_key` may be blank only when **lubelogger_key** is the only method ticked. The add-on will not start while a ticked method is missing a setting; it names the option in the log without printing values.
 
 ## Lock it down with Cloudflare
 
