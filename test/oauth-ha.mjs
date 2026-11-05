@@ -1349,6 +1349,35 @@ async function formTokens(client, opened, r) {
     await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, "203.0.113.50"));
   });
 
+  await check("a wrong password let in before the limiter filled is still counted when it fails", async () => {
+    clock += 15 * MINUTE;
+    const opened = await openApproval(claude, "alice");
+    const before = stubPassword.checks;
+    let release;
+    stubPassword.latch = new Promise((r) => (release = r));
+    let pending;
+    try {
+      pending = passwordForm(opened, "carol", WRONG_PASSWORD, "203.0.113.70");
+      // wait until the attempt has been let in and is being checked; bounded, so a failure cannot hang
+      for (let i = 0; i < 200 && stubPassword.checks === before; i++) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(stubPassword.checks, before + 1, "the attempt reached LubeLogger");
+      // the limiter fills while it is held
+      for (let i = 0; i < MAX_KEYS; i++) limiter.fail([`addr:flood-${i}`]);
+      assert.ok(limiter.lockedFor(["user:someone-new"]) > 0, "the limiter is full");
+    } finally {
+      release();
+      stubPassword.latch = undefined;
+    }
+    try {
+      assert.equal((await pending).status, 400);
+      assert.equal(limiter.failureCount("user:carol"), 1, "the username's failure is counted");
+      assert.equal(limiter.failureCount("addr:203.0.113.70"), 1, "the address's failure is counted");
+    } finally {
+      // the flood's failures expire, which empties the limiter for the checks after this one
+      clock += 15 * MINUTE;
+    }
+  });
+
   await check("an API-key connection calls LubeLogger with its own key; others use the shared key", async () => {
     const opened = await openApproval(claude, "alice");
     const viaKey = await formTokens(claude, opened, await keyForm(opened, PERSONAL_KEY, "198.51.100.50"));

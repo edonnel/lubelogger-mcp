@@ -5,10 +5,15 @@
 // Memory is bounded by failing closed: a key with a failure still in the window is never dropped, so a flood of junk
 // keys cannot reset anyone's count. When the map is full, a key that is not already held is treated as locked until
 // failures expire and make room.
+//
+// An attempt that was let in is always counted: `fail` records every key it is given, even past MAX_KEYS, so a map
+// that fills while an attempt is being checked cannot let its failure go unrecorded. That keeps memory bounded only
+// because callers record failures solely for attempts `lockedFor` let in, and `lockedFor` lets a key not held in only
+// while there is room: the map holds at most MAX_KEYS keys plus the keys of attempts in flight when it filled.
 
 export const MAX_FAILURES = 5;
 export const WINDOW_MS = 15 * 60_000;
-/** The most keys held at once. Past it, keys not already held are refused until room is freed. */
+/** The most keys `lockedFor` lets in. Past it, keys not already held are refused until room is freed. */
 export const MAX_KEYS = 50_000;
 /** Keys are cut to this length, so a long username cannot make a key arbitrarily large. */
 export const MAX_KEY_LENGTH = 200;
@@ -95,13 +100,15 @@ export class FailureLimiter {
     return wait;
   }
 
-  /** Records one failure against each key. A key not already held is not added while the map is full. */
+  /**
+   * Records one failure against each key, adding keys not held even when the map is full, so an attempt let in
+   * before the map filled is still counted. Call it only for an attempt `lockedFor` let in: that is what bounds memory.
+   */
   fail(keys: readonly string[]): void {
     const now = this.now();
     this.prune(now);
     for (const raw of keys) {
       const key = raw.slice(0, MAX_KEY_LENGTH);
-      if (!this.failures.has(key) && this.failures.size >= MAX_KEYS) continue;
       // only the newest MAX_FAILURES matter: the oldest of them decides when a locked key is free
       const counted = this.counted(key, now).slice(1 - MAX_FAILURES);
       counted.push(now);

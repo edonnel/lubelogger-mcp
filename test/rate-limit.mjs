@@ -18,6 +18,13 @@ function make() {
   return { clock, limiter: new FailureLimiter(() => clock.t) };
 }
 
+// one attempt as the sign-in form makes it: checked first, and recorded as a failure only when let in
+function attempt(limiter, keys) {
+  if (limiter.lockedFor(keys) > 0) return false;
+  limiter.fail(keys);
+  return true;
+}
+
 await check("five failures lock the key for 15 minutes; it is free again after", () => {
   const { clock, limiter } = make();
   for (let i = 0; i < MAX_FAILURES - 1; i++) {
@@ -54,29 +61,29 @@ await check("a locked username locks every address that tries it, and a locked a
   assert.ok(limiter.lockedFor(["addr:a", "user:y"]) > 0);
 });
 
-await check("memory stays bounded", () => {
+await check("memory stays bounded: attempts made one after another hold at most MAX_KEYS keys", () => {
   const { clock, limiter } = make();
-  for (let i = 0; i < 100_000; i++) limiter.fail([`addr:${i}`]);
+  for (let i = 0; i < 100_000; i++) attempt(limiter, [`addr:${i}`]);
   assert.ok(limiter.size() <= MAX_KEYS);
   clock.t += WINDOW_MS + 1;
-  limiter.fail(["addr:last"]);
+  assert.ok(attempt(limiter, ["addr:last"]));
   assert.equal(limiter.size(), 1);
 });
 
 await check("a flood of distinct live keys stays within MAX_KEYS, keeps earlier lockouts, and adds no new key", () => {
   const { limiter } = make();
   for (let i = 0; i < MAX_FAILURES; i++) limiter.fail(["user:locked"]);
-  for (let i = 0; i < MAX_KEYS + 10_000; i++) limiter.fail([`addr:${i}`]);
+  for (let i = 0; i < MAX_KEYS + 10_000; i++) attempt(limiter, [`addr:${i}`]);
   assert.ok(limiter.size() <= MAX_KEYS);
   assert.ok(limiter.lockedFor(["user:locked"]) > 0);
   assert.equal(limiter.held(`addr:${MAX_KEYS + 9_999}`), 0, "the last key of the flood was not added");
 });
 
-await check("when every key is locked, a new key is not tracked and is refused", () => {
+await check("when every key is locked, a new key is refused and so never tracked", () => {
   const { limiter } = make();
   for (let i = 0; i < MAX_KEYS; i++) for (let j = 0; j < MAX_FAILURES; j++) limiter.fail([`k${i}`]);
   assert.equal(limiter.size(), MAX_KEYS);
-  limiter.fail(["new"]);
+  assert.equal(attempt(limiter, ["new"]), false);
   assert.equal(limiter.size(), MAX_KEYS);
   assert.equal(limiter.held("new"), 0);
   assert.ok(limiter.lockedFor(["new"]) > 0);
@@ -87,17 +94,16 @@ await check("a flood of keys with one live failure each never resets a held key'
   const { clock, limiter } = make();
   for (let i = 0; i < MAX_FAILURES - 1; i++) limiter.fail(["user:alice"]);
   clock.t += 1000;
-  for (let i = 0; i < MAX_KEYS + 10_000; i++) limiter.fail([`addr:${i}`]);
+  for (let i = 0; i < MAX_KEYS + 10_000; i++) attempt(limiter, [`addr:${i}`]);
   assert.equal(limiter.size(), MAX_KEYS);
   assert.equal(limiter.failureCount("user:alice"), MAX_FAILURES - 1, "alice's four failures survive the flood");
-  assert.equal(limiter.lockedFor(["user:alice"]), 0);
-  limiter.fail(["user:alice"]);
+  assert.ok(attempt(limiter, ["user:alice"]));
   assert.ok(limiter.lockedFor(["user:alice"]) > 0, "the fifth failure locks alice");
 });
 
 await check("while the map is full, a key not held is refused, and allowed again after the window", () => {
   const { clock, limiter } = make();
-  for (let i = 0; i < MAX_KEYS + 10; i++) limiter.fail([`addr:${i}`]);
+  for (let i = 0; i < MAX_KEYS + 10; i++) attempt(limiter, [`addr:${i}`]);
   assert.equal(limiter.size(), MAX_KEYS);
   // the flood came in at one instant, before any prune, so the wait is a whole window
   assert.equal(limiter.lockedFor(["addr:brand-new"]), WINDOW_MS);
@@ -112,6 +118,30 @@ await check("while the map is full, a key not held is refused, and allowed again
   assert.equal(limiter.size(), 0, "checking pruned the expired keys");
   limiter.fail(["addr:brand-new"]);
   assert.equal(limiter.held("addr:brand-new"), 1);
+});
+
+await check("an attempt let in while there was room is counted even if the map fills before it fails", () => {
+  const { clock, limiter } = make();
+  for (let i = 0; i < MAX_KEYS - 1; i++) limiter.fail([`addr:${i}`]);
+  // five guesses at bob and one at carol are let in while there is still room: all six are in flight at once
+  for (let i = 0; i < MAX_FAILURES; i++) assert.equal(limiter.lockedFor(["user:bob"]), 0, "bob is let in");
+  assert.equal(limiter.lockedFor(["user:carol"]), 0, "carol is let in");
+  // other failures fill the map while those are being checked
+  limiter.fail(["addr:filler"]);
+  assert.equal(limiter.size(), MAX_KEYS);
+  limiter.fail(["user:bob"]);
+  assert.equal(limiter.failureCount("user:bob"), 1, "the first admitted failure is recorded");
+  for (let i = 1; i < MAX_FAILURES; i++) limiter.fail(["user:bob"]);
+  limiter.fail(["user:carol"]);
+  assert.ok(limiter.lockedFor(["user:bob"]) > 0, "five admitted failures lock bob");
+  assert.equal(limiter.failureCount("user:carol"), 1);
+  // the map goes past MAX_KEYS only by the keys that were let in: bob and carol
+  assert.equal(limiter.size(), MAX_KEYS + 2);
+  assert.ok(limiter.lockedFor(["user:dave"]) > 0, "a key not held is still refused past MAX_KEYS");
+  // once the failures expire, pruning brings the map back down
+  clock.t += WINDOW_MS;
+  assert.equal(limiter.lockedFor(["user:dave"]), 0);
+  assert.equal(limiter.size(), 0);
 });
 
 await check("a key that fails 100 times holds at most MAX_FAILURES timestamps and stays locked", () => {
