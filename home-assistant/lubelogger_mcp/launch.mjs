@@ -6,12 +6,36 @@ import { fileURLToPath } from "node:url";
 
 const STATE_DIR = "/data/oauth";
 
+/** The sign-in methods that are switched on. Each checkbox is on unless its option is exactly false, so 0.4 options keep working. */
+function enabled_methods(options) {
+	return options.homeassistant === false ? [] : ["homeassistant"];
+}
+
+/** Problems with the add-on options, as messages that name options and never contain their values. */
+export function check_options(options) {
+	const methods = enabled_methods(options);
+
+	if (methods.length === 0)
+		return ["switch on at least one sign-in method"];
+
+	const problems = [];
+
+	if (methods.includes("homeassistant")) {
+		for (const name of ["public_url", "home_assistant_public_url"]) {
+			if (typeof options[name] !== "string" || options[name] === "")
+				problems.push(`${name} is required while the homeassistant sign-in method is on`);
+		}
+	}
+
+	return problems;
+}
+
 /** Builds the server's environment from the add-on options. A leftover mcp_path from older installs is ignored. */
 export function buildEnv(options) {
 	const env = {
 		LUBELOGGER_URL: options.lubelogger_url,
 		LUBELOGGER_API_KEY: options.lubelogger_api_key,
-		AUTH_MODE: "homeassistant",
+		AUTH_METHODS: enabled_methods(options).join(","),
 		HOME_ASSISTANT_URL: "http://homeassistant:8123",
 		DATA_DIR: STATE_DIR,
 		PUBLIC_URL: options.public_url,
@@ -70,6 +94,16 @@ function drop_privileges(uid, gid) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
 	const options = JSON.parse(readFileSync("/data/options.json", "utf8"));
+
+	const problems = check_options(options);
+
+	if (problems.length > 0) {
+		for (const problem of problems)
+			console.error(`lubelogger-mcp add-on: ${problem}`);
+
+		process.exit(1);
+	}
+
 	Object.assign(process.env, buildEnv(options));
 
 	// the sign-in state must belong to the user the server runs as, and be unreadable by anyone else

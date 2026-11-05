@@ -159,7 +159,7 @@ await check("each method's settings are required only when it is on, and token c
 });
 
 // the add-on launcher: importing it does not run it
-const { buildEnv } = await import("../home-assistant/lubelogger_mcp/launch.mjs");
+const { buildEnv, check_options } = await import("../home-assistant/lubelogger_mcp/launch.mjs");
 const addonOptions = {
   lubelogger_url: "http://local-lubelogger:8080",
   lubelogger_api_key: "key",
@@ -178,6 +178,28 @@ check("the add-on passes allowed_redirect_hosts through as ALLOWED_REDIRECT_HOST
   const r = validateConfig(env);
   assert.equal(r.ok, true, JSON.stringify(r.problems));
   assert.deepEqual(r.config.ALLOWED_REDIRECT_HOSTS, ["claude.ai", "claude.com", "localhost", "127.0.0.1"]);
+});
+
+await check("0.4 options without a homeassistant key start in Home Assistant mode", () => {
+  const env = buildEnv(addonOptions);
+  assert.equal(env.AUTH_METHODS, "homeassistant");
+  assert.equal(env.AUTH_MODE, undefined);
+  assert.deepEqual(check_options(addonOptions), []);
+  assert.ok(validateConfig(env).ok);
+});
+
+await check("homeassistant: false with nothing else on is refused by the launcher", () => {
+  const problems = check_options({ ...addonOptions, homeassistant: false });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /at least one sign-in method/);
+});
+
+await check("a missing URL is named, and no option value appears in any message", () => {
+  const options = { ...addonOptions, lubelogger_api_key: "SECRET-PLANTED-77", public_url: "" };
+  const problems = check_options(options);
+  assert.ok(problems.some((p) => /public_url/.test(p)));
+  assert.ok(problems.every((p) => !p.includes("SECRET-PLANTED-77")));
+  assert.ok(check_options({ ...addonOptions, home_assistant_public_url: undefined }).some((p) => /home_assistant_public_url/.test(p)));
 });
 
 if (failed) {

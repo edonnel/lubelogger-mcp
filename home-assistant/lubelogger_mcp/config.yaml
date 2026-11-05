@@ -11,9 +11,11 @@ watchdog: http://[HOST]:[PORT:3000]/healthz
 options:
   lubelogger_url: http://local-lubelogger:8080
   lubelogger_api_key: ""
+  homeassistant: true
 schema:
   lubelogger_url: url
   lubelogger_api_key: password
-  public_url: url
-  home_assistant_public_url: url
+  homeassistant: bool?
+  public_url: url?
+  home_assistant_public_url: url?
   allowed_redirect_hosts: str?
