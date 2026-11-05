@@ -6,7 +6,8 @@ export const MAX_FAILURES = 5;
 export const WINDOW_MS = 15 * 60_000;
 /** The most keys held at once. Past it, the oldest key that is not locked makes room. */
 export const MAX_KEYS = 50_000;
-const MAX_KEY_LENGTH = 200;
+/** Keys are cut to this length, so a long username cannot make a key arbitrarily large. */
+export const MAX_KEY_LENGTH = 200;
 const PRUNE_EVERY_MS = 60_000;
 
 export class FailureLimiter {
@@ -41,6 +42,11 @@ export class FailureLimiter {
       counted.push(now);
       this.failures.set(key, counted);
     }
+  }
+
+  /** How many failures of a key are still inside the window. Read only. */
+  failureCount(key: string): number {
+    return this.counted(key.slice(0, MAX_KEY_LENGTH), this.now()).length;
   }
 
   /** How many keys are held. Exists so a test can check that keys are dropped. */

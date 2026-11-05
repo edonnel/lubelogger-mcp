@@ -1025,8 +1025,11 @@ const stubPassword = {
   form: "password",
   checks: 0,
   down: false,
+  // when set, check waits on it: holds attempts in flight
+  latch: undefined,
   async check(fields) {
     this.checks++;
+    if (this.latch) await this.latch;
     if (this.down) return { unavailable: "LubeLogger can't be reached right now. Try again shortly." };
     if (fields.username === "alice" && fields.password === RIGHT_PASSWORD)
       return { person: { id: "alice", name: "alice" }, upstream: { username: "alice" } };
@@ -1274,6 +1277,42 @@ async function formTokens(client, opened, r) {
     const fresh = await openApproval(claude, "alice");
     await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, byAddress));
     assert.equal(stubPassword.checks, checks + 1);
+  });
+
+  await check("concurrent wrong passwords cannot get past the limiter: at most five reach LubeLogger", async () => {
+    clock += 15 * MINUTE;
+    const opened = await openApproval(claude, "alice");
+    const ip = "198.51.100.60";
+    const before = stubPassword.checks;
+    let release;
+    stubPassword.latch = new Promise((r) => (release = r));
+    let settled = 0;
+    const posts = [];
+    try {
+      for (let i = 0; i < 10; i++)
+        posts.push(
+          passwordForm(opened, `burst${i}`, WRONG_PASSWORD, ip).then(async (r) => {
+            settled++;
+            return { status: r.status, html: await r.text() };
+          }),
+        );
+      // the five refused at once answer while the other five are still held; bounded, so a failure cannot hang
+      for (let i = 0; i < 200 && settled < 5; i++) await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      release();
+      stubPassword.latch = undefined;
+    }
+    const answers = await Promise.all(posts);
+    assert.ok(stubPassword.checks - before <= 5, `${stubPassword.checks - before} attempts reached LubeLogger`);
+    const refused = answers.filter((a) => a.status === 429);
+    assert.equal(refused.length, 10 - (stubPassword.checks - before));
+    for (const a of refused) assert.match(errorOf(a.html) ?? "", /^Too many attempts\. Try again in \d+ minutes\.$/);
+    assert.ok(answers.every((a) => a.status === 429 || a.status === 400));
+
+    // 15 minutes later the address is free again
+    clock += 15 * MINUTE;
+    const fresh = await openApproval(claude, "alice");
+    await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, ip));
   });
 
   await check("an API-key connection calls LubeLogger with its own key; others use the shared key", async () => {

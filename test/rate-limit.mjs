@@ -99,6 +99,22 @@ await check("keys that differ only after character 200 are the same key", () => 
   assert.ok(limiter.lockedFor([base + "other"]) > 0);
 });
 
+await check("failureCount() counts a key's failures inside the window and changes nothing", () => {
+  const { clock, limiter } = make();
+  assert.equal(limiter.failureCount("user:dave"), 0);
+  limiter.fail(["user:dave"]);
+  clock.t += 1000;
+  limiter.fail(["user:dave"]);
+  assert.equal(limiter.failureCount("user:dave"), 2);
+  assert.equal(limiter.failureCount("user:" + "x".repeat(300)), 0);
+  assert.equal(limiter.size(), 1, "reading a key does not add it");
+  assert.equal(limiter.lockedFor(["user:dave"]), 0);
+  clock.t += WINDOW_MS - 1000;
+  assert.equal(limiter.failureCount("user:dave"), 1, "the first one has left the window");
+  clock.t += 1000;
+  assert.equal(limiter.failureCount("user:dave"), 0);
+});
+
 if (failed) {
   process.stderr.write(`${failed} check(s) failed\n`);
   process.exit(1);

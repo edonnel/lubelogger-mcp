@@ -27,7 +27,7 @@ import {
   type LoginMethod,
   type RecheckResult,
 } from "./login-method.js";
-import { FailureLimiter } from "./rate-limit.js";
+import { FailureLimiter, MAX_FAILURES, MAX_KEY_LENGTH, WINDOW_MS } from "./rate-limit.js";
 import {
   BUTTON_LABEL,
   escapeHtml,
@@ -185,6 +185,9 @@ export class LoginProvider implements OAuthServerProvider {
 
   // failed form sign-ins, by address and by username
   private readonly limiter: FailureLimiter;
+
+  // form sign-ins being checked right now, by limiter key; a key is removed when its count drops to 0
+  private readonly inFlight = new Map<string, number>();
 
   private lastPurge: number;
 
@@ -400,17 +403,22 @@ export class LoginProvider implements OAuthServerProvider {
       this.showScreen(res, status, loginState, entry, { form: method.form, message, username });
 
     // the address always, and the username for the password form: either one being locked refuses the attempt
+    // cut as the limiter cuts them, so the in-flight count and the limiter agree on what a key is
     const keys = [`addr:${req.ip ?? "unknown"}`];
     if (username) keys.push(`user:${username.toLowerCase()}`);
+    for (const [i, key] of keys.entries()) keys[i] = key.slice(0, MAX_KEY_LENGTH);
     const wait = this.limiter.lockedFor(keys);
-    if (wait > 0) {
+    // attempts still being checked count too: otherwise a burst of posts all pass before any failure is recorded
+    const busy = keys.some((key) => (this.inFlight.get(key) ?? 0) + this.limiter.failureCount(key) >= MAX_FAILURES);
+    if (wait > 0 || busy) {
       // nothing is sent to LubeLogger, and this refusal is not itself counted as a failure
       log("sign-in refused: too many failed attempts");
-      showAgain(429, `Too many attempts. Try again in ${Math.ceil(wait / 60_000)} minutes.`);
+      showAgain(429, `Too many attempts. Try again in ${Math.ceil((wait || WINDOW_MS) / 60_000)} minutes.`);
       return;
     }
 
     let result: FormCheckResult;
+    for (const key of keys) this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1);
     try {
       result = await method.check(fields);
     } catch {
@@ -418,6 +426,13 @@ export class LoginProvider implements OAuthServerProvider {
       log("sign-in check failed");
       showAgain(503, "The sign-in could not be checked. Try again shortly.");
       return;
+    } finally {
+      // runs before the failure below is recorded, with no await between, so no attempt is counted twice or not at all
+      for (const key of keys) {
+        const left = (this.inFlight.get(key) ?? 1) - 1;
+        if (left > 0) this.inFlight.set(key, left);
+        else this.inFlight.delete(key);
+      }
     }
 
     if ("invalid" in result) {
