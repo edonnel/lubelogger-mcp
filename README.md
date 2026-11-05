@@ -173,6 +173,18 @@ Only Home Assistant admins (`is_admin`) can connect. Access tokens last 1 hour a
 
 **If it stops working for everyone.** Home Assistant's IP ban (`ip_ban_enabled`) is the one thing to watch: if it ever banned this server's address, every connection would end at its next refresh.
 
+### Upgrading the add-on from 0.3.x
+
+Version 0.4 switches the add-on to Home Assistant sign-in. It adds two required options, `public_url` and `home_assistant_public_url`, and drops `mcp_path`. The old version's settings form can't hold the new options, so they can only be filled in after the update, and the add-on stays stopped until they are:
+
+1. Take a backup of the add-on (Settings → System → Backups, partial, this add-on only). Restoring it brings back the secret-path version.
+2. Update. The Supervisor installs the new version, then refuses to start it with "invalid options: Missing option 'public_url'".
+3. On the Configuration tab, fill in `public_url` (this server's public address, e.g. `https://mcp.example.com`) and `home_assistant_public_url` (e.g. `https://ha.example.com`), save, and start the add-on. The old `mcp_path` is removed when you save.
+4. If you use the Cloudflare rule, add the sign-in path exception described [below](#lock-it-down-with-cloudflare).
+5. In Claude, remove the old connector and add the plain `https://mcp.example.com/mcp` URL. The old secret path now answers 404.
+
+**Watch the error in step 2.** The Supervisor's "invalid options" message repeats every current option, the LubeLogger API key and the old secret path included, and it lands in the Supervisor log. If anyone else can read that output, create a new LubeLogger API key, put it in the add-on, and delete the old one.
+
 ### Claude Code in Home Assistant mode
 
 Claude Code connects through the same OAuth sign-in, with the plain URL and no header:
