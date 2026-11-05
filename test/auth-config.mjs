@@ -178,10 +178,17 @@ await check("no OIDC setting value appears in any problem", () => {
   assert.equal(r.ok, false);
   assert.ok(r.problems.every((p) => !p.includes("SECRET-PLANTED-31")));
 });
-await check("list settings are split on commas, trimmed, empties dropped; issuer slashes trimmed", () => {
-  const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: " a@example.com, ,b@example.com,", OIDC_ISSUER: "https://idp.example.com/realms/home//", AUTH_METHODS: "oidc" });
+await check("list settings are split on commas, trimmed, empties dropped", () => {
+  const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: " a@example.com, ,b@example.com,", AUTH_METHODS: "oidc" });
   assert.deepEqual(r.config.OIDC_ALLOWED_EMAILS, ["a@example.com", "b@example.com"]);
-  assert.equal(r.config.OIDC_ISSUER, "https://idp.example.com/realms/home");
+});
+await check("the issuer is kept exactly as given, a trailing slash included", () => {
+  // the provider's discovery document must name the same issuer, character for character
+  const slash = validateConfig({ ...oidc, OIDC_ISSUER: "https://idp.example.com/application/o/mcp/", AUTH_METHODS: "oidc" });
+  assert.ok(slash.ok, JSON.stringify(slash.problems));
+  assert.equal(slash.config.OIDC_ISSUER, "https://idp.example.com/application/o/mcp/");
+  const bare = validateConfig({ ...oidc, OIDC_ISSUER: "https://idp.example.com/realms/home", AUTH_METHODS: "oidc" });
+  assert.equal(bare.config.OIDC_ISSUER, "https://idp.example.com/realms/home");
 });
 await check("a required group alone satisfies the allowlist", () => {
   const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: undefined, OIDC_REQUIRED_GROUP: "mcp", AUTH_METHODS: "oidc" });

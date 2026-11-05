@@ -178,7 +178,7 @@ The sign-in screen has one button per method that is switched on. Only Home Assi
 
 **Switching a method off.** While the server still has other methods on, connections made with a method that has been switched off are removed, at the next start or at their next refresh, whichever comes first. If the switched-off method's settings are still in place, the server also revokes its sessions at the source (for Home Assistant the refresh token, for OpenID Connect the refresh token when the provider has a revocation endpoint), so there is nothing left to delete there. If the settings are gone, it cannot reach the source and does not try, so delete those sessions yourself. For Home Assistant that is Profile, then Refresh tokens. If the method you switch off is the only one on, the server goes back to token mode, which leaves the sign-in data alone: existing connections stay in the data file and work again if the method is switched back on within 90 days. The add-on will not start with no method switched on.
 
-The startup log says which methods are on: `auth homeassistant`, or `auth token` in token mode.
+The startup log says which methods are on: `auth homeassistant`, `auth homeassistant,oidc` with both methods on, or `auth token` in token mode.
 
 ### Upgrading the add-on from 0.4 to 0.5
 
@@ -240,15 +240,17 @@ OIDC_ALLOWED_EMAILS=alice@example.com
 1. Create an OpenID Connect client (sometimes called an application). A confidential client with a secret or a public client both work.
 2. Set its redirect URI to `https://mcp.example.com/login/callback`, where the host is your `PUBLIC_URL`.
 3. Allow the `openid`, `email` and `profile` scopes. For `OIDC_REQUIRED_GROUP`, make sure the provider puts groups in the ID token under the claim named by `OIDC_GROUPS_CLAIM`.
+
+   The server reads claims from the ID token only, never from the userinfo endpoint, so the email (with `email_verified`) and the groups claim must be in the ID token. Some providers put them only in userinfo by default; an allowlist on a claim that is missing from the ID token refuses everyone.
 4. Copy the client id (and the secret, if any) into the settings above.
 
-**Refresh tokens.** The connection stays alive by refreshing at the provider every hour, which needs a refresh token. A provider that issues none ends the connection within the hour, when the ID token it started with expires, and the person signs in again. Google only issues a refresh token when asked for one, so set
+**Refresh tokens.** The connection stays alive by refreshing at the provider every hour, which needs a refresh token. A provider that issues none ends the connection when the ID token it started with expires, typically within the hour, and the person signs in again. Google only issues a refresh token when asked for one, so set
 
 ```env
 OIDC_AUTH_PARAMS=access_type=offline&prompt=consent
 ```
 
-Each refresh checks the allowlist again, so removing someone from `OIDC_ALLOWED_EMAILS`, or from the group, disconnects them at their next refresh. If the provider completes a refresh but the answer is lost on the way, for example by a timeout, the retry is refused and the person signs in again.
+Each refresh checks the allowlist again against the new ID token, so removing someone from `OIDC_ALLOWED_EMAILS`, or from the group, disconnects them at their next refresh, provided the provider returns a new ID token on that refresh. A provider that refreshes without one leaves the old ID token's claims standing until that ID token expires, and the removal takes effect then. If the provider completes a refresh but the answer is lost on the way, for example by a timeout, the retry is refused and the person signs in again.
 
 **Disconnect.** When a connection ends, the server revokes its refresh token at the provider, if the provider has a revocation endpoint. Without one, end the session at the provider.
 

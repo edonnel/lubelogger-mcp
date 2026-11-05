@@ -53,6 +53,20 @@ function statusOf(err: unknown): number | undefined {
 }
 
 /**
+ * What a failed refresh says about the person. Only a definite no from the token endpoint (a 400 or 403, e.g.
+ * invalid_grant) is "refused". Trouble with this server's own credentials (a 401, a challenge, invalid_client or
+ * unauthorized_client in any status), rate limiting, a 5xx, a network error or a timeout is "unavailable", so a
+ * rotated client secret or a busy provider never ends every connection.
+ */
+function refreshVerdict(err: unknown): "refused" | "unavailable" {
+  if (err instanceof client.WWWAuthenticateChallengeError) return "unavailable";
+  const code = err instanceof client.ResponseBodyError ? err.error : undefined;
+  if (code === "invalid_client" || code === "unauthorized_client") return "unavailable";
+  const status = statusOf(err);
+  return status === 400 || status === 403 ? "refused" : "unavailable";
+}
+
+/**
  * A fixed description of an openid-client failure. Library messages are never passed on as they are:
  * some quote response bodies, and a body can echo a code or token.
  */
@@ -215,8 +229,7 @@ export class OidcLogin implements LoginMethod {
     try {
       tokens = await client.refreshTokenGrant(config, refreshToken);
     } catch (err) {
-      const status = statusOf(err);
-      return { ok: false, reason: status !== undefined && status >= 400 && status < 500 ? "refused" : "unavailable" };
+      return { ok: false, reason: refreshVerdict(err) };
     }
 
     const nextRefresh = tokens.refresh_token || refreshToken;

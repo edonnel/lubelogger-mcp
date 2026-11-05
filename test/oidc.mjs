@@ -49,6 +49,8 @@ function sign(claims, key = goodKey.privateKey) {
 
 const idp = {
   port: 0,
+  // a path the issuer lives under, e.g. "/application/o/mcp/"; its endpoints hang off it
+  base: "",
   server: undefined,
   revocation: true,
   scopes: ["openid", "email", "profile", "offline_access"],
@@ -66,7 +68,8 @@ const idp = {
   tokenAuth: [],
   revoked: [],
 };
-const issuer = () => `http://127.0.0.1:${idp.port}`;
+const issuer = () => `http://127.0.0.1:${idp.port}${idp.base}`;
+const root = () => `http://127.0.0.1:${idp.port}${idp.base.replace(/\/$/, "")}`;
 
 function baseClaims() {
   const now = Math.floor(Date.now() / 1000);
@@ -96,6 +99,9 @@ async function readBody(req) {
 
 async function handle(req, res) {
   const url = new URL(req.url, issuer());
+  const prefix = idp.base.replace(/\/$/, "");
+  if (prefix && !url.pathname.startsWith(`${prefix}/`)) return res.writeHead(404).end();
+  url.pathname = url.pathname.slice(prefix.length);
   const send = (code, obj) => {
     res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
     res.end(JSON.stringify(obj));
@@ -104,9 +110,9 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/.well-known/openid-configuration") {
     const doc = {
       issuer: issuer(),
-      authorization_endpoint: `${issuer()}/authorize`,
-      token_endpoint: `${issuer()}/token`,
-      jwks_uri: `${issuer()}/jwks`,
+      authorization_endpoint: `${root()}/authorize`,
+      token_endpoint: `${root()}/token`,
+      jwks_uri: `${root()}/jwks`,
       response_types_supported: ["code"],
       subject_types_supported: ["public"],
       id_token_signing_alg_values_supported: ["RS256"],
@@ -114,7 +120,7 @@ async function handle(req, res) {
       token_endpoint_auth_methods_supported: ["client_secret_basic"],
       scopes_supported: idp.scopes,
     };
-    if (idp.revocation) doc.revocation_endpoint = `${issuer()}/revoke`;
+    if (idp.revocation) doc.revocation_endpoint = `${root()}/revoke`;
     return send(200, doc);
   }
   if (req.method === "GET" && url.pathname === "/jwks") return send(200, { keys: [jwk] });
@@ -122,6 +128,10 @@ async function handle(req, res) {
     const body = await readBody(req);
     idp.tokenBodies.push(body);
     idp.tokenAuth.push(req.headers.authorization ?? "");
+    if (idp.challenge) {
+      res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Basic realm="idp", error="invalid_client"' });
+      return res.end(JSON.stringify({ error: "invalid_client" }));
+    }
     if (idp.tokenStatus !== 200) {
       if (idp.tokenError) return send(idp.tokenStatus, { error: idp.tokenError });
       res.writeHead(idp.tokenStatus, { "content-type": "text/plain" });
@@ -184,6 +194,7 @@ function stopIdp() {
 
 function resetIdp() {
   Object.assign(idp, {
+    base: "",
     revocation: true,
     scopes: ["openid", "email", "profile", "offline_access"],
     claims: {},
@@ -192,6 +203,7 @@ function resetIdp() {
     codeChallenge: undefined,
     tokenStatus: 200,
     tokenError: undefined,
+    challenge: false,
     issueRefresh: true,
     idTokenOnRefresh: true,
     tokenBodies: [],
@@ -306,6 +318,15 @@ await check("an allowed email that is verified signs in", async () => {
   assert.equal(body.get("redirect_uri"), "https://mcp.example.com/login/callback");
   assert.ok(idp.tokenAuth.at(-1).startsWith("Basic "), "client_secret_basic is used");
   assert.deepEqual(idp.revoked, []);
+});
+
+await check("an issuer whose identifier ends in a slash signs in", async () => {
+  resetIdp();
+  idp.base = "/application/o/mcp/";
+  assert.ok(issuer().endsWith("/application/o/mcp/"));
+  const r = await signIn(login());
+  assert.deepEqual(r.person, { id: "sub-alice", name: "Alice" });
+  assert.equal(r.upstream.sub, "sub-alice");
 });
 
 await check("an allowed email that is not verified is refused", async () => {
@@ -427,10 +448,31 @@ await check("recheck refreshes and re-applies the allowlist", async () => {
   idp.tokenError = "invalid_grant";
   assert.deepEqual(await m.recheck(r.upstream), { ok: false, reason: "refused" });
 
-  idp.tokenStatus = 503;
-  idp.tokenError = undefined;
-  assert.deepEqual(await m.recheck(r.upstream), { ok: false, reason: "unavailable" });
+  idp.tokenStatus = 403;
+  idp.tokenError = "access_denied";
+  assert.deepEqual(await m.recheck(r.upstream), { ok: false, reason: "refused" });
+
+  // trouble with this server's own credentials, or with the provider, is never a verdict on the person
+  for (const [status, error] of [
+    [401, "invalid_client"],
+    [400, "invalid_client"],
+    [400, "unauthorized_client"],
+    [401, undefined],
+    [429, undefined],
+    [503, undefined],
+    [500, "server_error"],
+  ]) {
+    idp.tokenStatus = status;
+    idp.tokenError = error;
+    assert.deepEqual(await m.recheck(r.upstream), { ok: false, reason: "unavailable" }, `${status} ${error}`);
+  }
   idp.tokenStatus = 200;
+  idp.tokenError = undefined;
+
+  // a 401 with a WWW-Authenticate challenge
+  idp.challenge = true;
+  assert.deepEqual(await m.recheck(r.upstream), { ok: false, reason: "unavailable" });
+  idp.challenge = false;
 
   await stopIdp();
   assert.deepEqual(await m.recheck(r.upstream), { ok: false, reason: "unavailable" });

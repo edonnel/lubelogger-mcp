@@ -46,13 +46,21 @@ const commaList = z
   .default("")
   .transform((v) => v.split(",").map((e) => e.trim()).filter((e) => e !== ""));
 
-/** An OpenID Connect issuer: trailing slashes trimmed, a path allowed, https only (plain http on localhost for testing). */
+/**
+ * An OpenID Connect issuer, kept exactly as given: discovery compares it to the provider's own issuer character for
+ * character, so a trailing slash is part of the identifier. A path is allowed; https only (plain http on localhost for testing).
+ */
 const issuerUrl = z
   .string()
   .url("must be a full URL, e.g. https://idp.example.com/realms/home")
-  .transform((v) => v.replace(/\/+$/, ""))
   .refine((v) => {
-    const u = new URL(v);
+    // with no transform in between, this runs after a failed url check too; that check already reports it
+    let u: URL;
+    try {
+      u = new URL(v);
+    } catch {
+      return true;
+    }
     return u.protocol === "https:" || (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1"));
   }, "must use https (http is accepted only for localhost or 127.0.0.1)");
 
