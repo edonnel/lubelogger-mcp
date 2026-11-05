@@ -5,7 +5,8 @@ const schema = z.object({
     .string()
     .url("must be a full URL, e.g. http://lubelogger:8080")
     .transform((v) => v.replace(/\/+$/, "")),
-  LUBELOGGER_API_KEY: z.string().min(1, "is required (create one in LubeLogger, Editor role is enough)"),
+  /** Required unless lubelogger-key is the only sign-in method on (checked below). */
+  LUBELOGGER_API_KEY: z.string().min(1).optional(),
   /** Optional bearer token required on the MCP endpoint. */
   MCP_AUTH_TOKEN: z.string().min(16, "should be at least 16 characters").optional(),
   /** Endpoint path. Use a long random path (e.g. /mcp/<random>) if you expose this publicly without a bearer token. */
@@ -27,7 +28,7 @@ export const METHOD_NAMES = ["homeassistant", "oidc", "lubelogger-password", "lu
 export type MethodName = (typeof METHOD_NAMES)[number];
 
 /** This version implements these methods; the rest are accepted by the schema but refuse to start. */
-const AVAILABLE_METHODS: readonly MethodName[] = ["homeassistant", "oidc"];
+const AVAILABLE_METHODS: readonly MethodName[] = ["homeassistant", "oidc", "lubelogger-password", "lubelogger-key"];
 
 /** A bare origin: trailing slashes are trimmed and any path, query or fragment is refused. */
 const originUrl = (example: string) =>
@@ -84,6 +85,8 @@ const authSchema = z.object({
   OIDC_ALLOWED_EMAILS: commaList,
   OIDC_ALLOWED_SUBJECTS: commaList,
   OIDC_REQUIRED_GROUP: z.string().min(1).optional(),
+  /** LubeLogger usernames allowed to sign in with the lubelogger-password method. */
+  LUBELOGGER_ALLOWED_USERS: commaList,
   OIDC_GROUPS_CLAIM: z.string().min(1).default("groups"),
   /** Extra query parameters for the authorization request, passed through as given. */
   OIDC_AUTH_PARAMS: z.string().min(1).optional(),
@@ -174,6 +177,14 @@ const checkedSchema = fullSchema
       return;
     }
 
+    // the shared key is needed in token mode and by every method except lubelogger-key (which signs in with each person's own key)
+    if (c.LUBELOGGER_API_KEY === undefined && !(methods.length === 1 && methods[0] === "lubelogger-key"))
+      ctx.addIssue({
+        code: "custom",
+        path: ["LUBELOGGER_API_KEY"],
+        message: "is required (create one in LubeLogger, Editor role is enough)",
+      });
+
     if (methods.length === 0) {
       if (c.MCP_AUTH_TOKEN === undefined && !c.MCP_PATH.split("/").some((s) => s.length >= MIN_SECRET_SEGMENT))
         ctx.addIssue({
@@ -211,6 +222,13 @@ const checkedSchema = fullSchema
             path: [name],
             message: "is required when the homeassistant sign-in method is on",
           });
+
+    if (methods.includes("lubelogger-password") && c.LUBELOGGER_ALLOWED_USERS.length === 0)
+      ctx.addIssue({
+        code: "custom",
+        path: ["LUBELOGGER_ALLOWED_USERS"],
+        message: "is required when the lubelogger-password sign-in method is on",
+      });
 
     if (methods.includes("oidc")) {
       for (const name of ["OIDC_ISSUER", "OIDC_CLIENT_ID"] as const)

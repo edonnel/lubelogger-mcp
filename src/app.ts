@@ -49,11 +49,15 @@ export async function createApp(
   config: Config,
   deps: AppDeps = {},
 ): Promise<{ app: express.Express; close(): Promise<void> }> {
-  const client = new LubeLoggerClient(config.LUBELOGGER_URL, config.LUBELOGGER_API_KEY, config.REQUEST_TIMEOUT_MS);
+  // absent when lubelogger-key is the only method on; Task 4 builds a client per connection
+  const client = config.LUBELOGGER_API_KEY
+    ? new LubeLoggerClient(config.LUBELOGGER_URL, config.LUBELOGGER_API_KEY, config.REQUEST_TIMEOUT_MS)
+    : undefined;
   const pending = new PendingStore(config.CONFIRM_TTL_MINUTES * 60_000);
 
   // the LubeLogger client a verified request works with; every connection uses the shared key for now
   function clientFor(_auth?: AuthInfo): LubeLoggerClient {
+    if (!client) throw new Error("no shared LubeLogger API key is configured");
     return client;
   }
 

@@ -169,9 +169,25 @@ await check("an issuer must be https, except on localhost", () => {
   assert.ok(validateConfig({ ...oidc, OIDC_ISSUER: "http://localhost:9000/realms/home", AUTH_METHODS: "oidc" }).ok);
   assert.ok(validateConfig({ ...oidc, OIDC_ISSUER: "http://127.0.0.1:9000", AUTH_METHODS: "oidc" }).ok);
 });
-await check("lubelogger methods still refuse to start", () => {
-  const r = validateConfig({ ...ha, AUTH_METHODS: "homeassistant,lubelogger-key" });
-  assert.ok(r.problems.some((p) => /lubelogger-key.*not available in this version/.test(p)));
+const ll = { ...base, PUBLIC_URL: "https://mcp.example.com" };
+
+await check("lubelogger-password needs an allowlist of usernames", () => {
+  const no = validateConfig({ ...ll, AUTH_METHODS: "lubelogger-password" });
+  assert.ok(no.problems.some((p) => p.startsWith("LUBELOGGER_ALLOWED_USERS") && /lubelogger-password sign-in method/.test(p)));
+  const yes = validateConfig({ ...ll, AUTH_METHODS: "lubelogger-password", LUBELOGGER_ALLOWED_USERS: " alice , bob " });
+  assert.ok(yes.ok, JSON.stringify(yes.problems));
+  assert.deepEqual(yes.config.LUBELOGGER_ALLOWED_USERS, ["alice", "bob"]);
+});
+await check("lubelogger-key alone needs no shared key; anything else still does", () => {
+  const { LUBELOGGER_API_KEY, ...noKey } = ll;
+  assert.ok(validateConfig({ ...noKey, AUTH_METHODS: "lubelogger-key" }).ok);
+  const both = validateConfig({ ...noKey, AUTH_METHODS: "lubelogger-key,lubelogger-password", LUBELOGGER_ALLOWED_USERS: "alice" });
+  assert.ok(both.problems.some((p) => p.startsWith("LUBELOGGER_API_KEY")));
+  assert.equal(validateConfig({ ...noKey, MCP_AUTH_TOKEN: "x".repeat(24) }).ok, false);
+});
+await check("all four methods can be on together", () => {
+  const r = validateConfig({ ...ha, ...oidc, AUTH_METHODS: "homeassistant,oidc,lubelogger-password,lubelogger-key", LUBELOGGER_ALLOWED_USERS: "alice" });
+  assert.ok(r.ok, JSON.stringify(r.problems));
 });
 await check("no OIDC setting value appears in any problem", () => {
   const r = validateConfig({ ...oidc, OIDC_CLIENT_SECRET: "SECRET-PLANTED-31", OIDC_ISSUER: "not a url", AUTH_METHODS: "oidc" });
