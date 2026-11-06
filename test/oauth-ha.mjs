@@ -11,7 +11,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { WebSocketServer } from "ws";
 import { createApp } from "../dist/app.js";
-import { LoginProvider } from "../dist/auth/provider.js";
+import { LoginProvider, STILL_CHECKING } from "../dist/auth/provider.js";
 import { FailureLimiter, MAX_KEYS } from "../dist/auth/rate-limit.js";
 import { AuthStore, hashToken } from "../dist/auth/store.js";
 import { validateConfig } from "../dist/config.js";
@@ -861,6 +861,51 @@ await check("a connection whose method is switched off is ended at refresh, and 
   }
 });
 
+await check("startup does not wait on a switched-off method's cleanup", async () => {
+  const hungDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-hung-"));
+  let provider;
+  // close() waits on the purge, so it is only called once the purge has finished
+  let purged = false;
+  try {
+    const store = await AuthStore.open(hungDir, now);
+    for (const name of ["dana", "erin", "frank"])
+      await store.putConnection({
+        id: `conn-${name}`,
+        clientId: "client-hung",
+        method: "oidc",
+        person: { id: `id-${name}`, name },
+        upstream: { session: `up-${name}-hung`, name },
+        refreshHash: hashToken(randomBytes(32).toString("base64url")),
+        lastUsedAt: clock,
+      });
+    // the retired method's cleanup never answers, as an identity provider that hangs would
+    const hung = {
+      ...stub,
+      cleanups: 0,
+      cleanup() {
+        this.cleanups++;
+        return new Promise(() => {});
+      },
+    };
+    provider = new LoginProvider(store, new Map([["homeassistant", stub]]), now, { retired: new Map([["oidc", hung]]) });
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("startPurging did not resolve within 1 s")), 1000);
+    });
+    try {
+      await Promise.race([provider.startPurging(), timeout]);
+      purged = true;
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.deepEqual(store.connections(), [], "the connections are gone from the store");
+    assert.equal(hung.cleanups, 3, "each connection's cleanup was started");
+  } finally {
+    if (purged) await provider.close();
+    await fs.rm(hungDir, { recursive: true, force: true });
+  }
+});
+
 await check("logins are logged by name, never with a token or code", async () => {
   const all = logs.join("\n");
   assert.match(all, /alice/);
@@ -1083,7 +1128,10 @@ const stubPassword = {
   async recheck(upstream) {
     return { ok: true, upstream, person: { id: upstream.username, name: upstream.username } };
   },
-  async cleanup() {},
+  cleanups: 0,
+  async cleanup() {
+    this.cleanups++;
+  },
 };
 
 // alice's own key signs in as alice and the connection keeps the key
@@ -1322,7 +1370,7 @@ async function formTokens(client, opened, r) {
     assert.equal(stubPassword.checks, checks + 1);
   });
 
-  await check("concurrent wrong passwords cannot get past the limiter: at most five reach LubeLogger", async () => {
+  await check("concurrent wrong passwords cannot get past the limiter: only five reach LubeLogger", async () => {
     clock += 15 * MINUTE;
     const opened = await openApproval(claude, "alice");
     const ip = "198.51.100.60";
@@ -1346,16 +1394,102 @@ async function formTokens(client, opened, r) {
       stubPassword.latch = undefined;
     }
     const answers = await Promise.all(posts);
-    assert.ok(stubPassword.checks - before <= 5, `${stubPassword.checks - before} attempts reached LubeLogger`);
+    assert.equal(stubPassword.checks - before, 5, "exactly five attempts reached LubeLogger");
     const refused = answers.filter((a) => a.status === 429);
-    assert.equal(refused.length, 10 - (stubPassword.checks - before));
-    for (const a of refused) assert.match(errorOf(a.html) ?? "", /^Too many attempts\. Try again in \d+ minutes\.$/);
+    assert.equal(refused.length, 5);
+    // refused while the five were still being checked, before any failure was counted
+    for (const a of refused) assert.equal(errorOf(a.html), STILL_CHECKING);
     assert.ok(answers.every((a) => a.status === 429 || a.status === 400));
 
     // 15 minutes later the address is free again
     clock += 15 * MINUTE;
     const fresh = await openApproval(claude, "alice");
     await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, ip));
+  });
+
+  await check("a refusal caused only by attempts in flight says so", async () => {
+    clock += 15 * MINUTE;
+    const opened = await openApproval(claude, "alice");
+    const ip = "198.51.100.90";
+    const before = stubPassword.checks;
+    let release;
+    stubPassword.latch = new Promise((r) => (release = r));
+    const held = [];
+    let sixth;
+    try {
+      for (let i = 0; i < 5; i++) held.push(passwordForm(opened, `held${i}`, WRONG_PASSWORD, ip));
+      // wait until all five are being checked; bounded, so a failure cannot hang
+      for (let i = 0; i < 200 && stubPassword.checks - before < 5; i++) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(stubPassword.checks - before, 5, "five attempts are in flight");
+      sixth = await passwordForm(opened, "held5", WRONG_PASSWORD, ip);
+    } finally {
+      release();
+      stubPassword.latch = undefined;
+    }
+    assert.equal(sixth.status, 429);
+    assert.equal(errorOf(await sixth.text()), STILL_CHECKING);
+    assert.equal(stubPassword.checks - before, 5, "the sixth never reached LubeLogger");
+    for (const r of await Promise.all(held)) assert.equal(r.status, 400);
+    // the five failures age out for the checks after this one
+    clock += 15 * MINUTE;
+  });
+
+  await check("the wait shown is when the key is free", async () => {
+    clock += 15 * MINUTE;
+    const ip = "198.51.100.91";
+    const key = `addr:${ip}`;
+    // six failures, as an overshoot would leave them, 50 seconds apart; the fifth newest decides when it is free
+    const first = clock;
+    for (let i = 0; i < 6; i++) {
+      limiter.fail([key]);
+      clock += 50_000;
+    }
+    // the key is free once only four remain in the window: when the second failure is 15 minutes old
+    const freeAt = first + 50_000 + 15 * MINUTE;
+    const opened = await openApproval(claude, "alice");
+    const checks = stubPassword.checks;
+    const locked = await passwordForm(opened, "alice", RIGHT_PASSWORD, ip);
+    assert.equal(locked.status, 429);
+    assert.equal(errorOf(await locked.text()), `Too many attempts. Try again in ${Math.ceil((freeAt - clock) / MINUTE)} minutes.`);
+
+    clock = freeAt - 1;
+    const stillLocked = await openApproval(claude, "alice");
+    assert.equal((await passwordForm(stillLocked, "alice", RIGHT_PASSWORD, ip)).status, 429);
+    assert.equal(stubPassword.checks, checks, "LubeLogger is not asked while it is locked");
+
+    clock = freeAt;
+    const fresh = await openApproval(claude, "alice");
+    await formTokens(claude, fresh, await passwordForm(fresh, "alice", RIGHT_PASSWORD, ip));
+    assert.equal(stubPassword.checks, checks + 1, "the next post is let in");
+    clock += 15 * MINUTE;
+  });
+
+  await check("a post that loses the state while LubeLogger is asked gets the expired page", async () => {
+    clock += 15 * MINUTE;
+    const opened = await openApproval(claude, "alice");
+    const ip = "198.51.100.92";
+    const before = stubPassword.checks;
+    const cleanups = stubPassword.cleanups;
+    let release;
+    stubPassword.latch = new Promise((r) => (release = r));
+    let posts;
+    try {
+      posts = [passwordForm(opened, "alice", RIGHT_PASSWORD, ip), passwordForm(opened, "alice", RIGHT_PASSWORD, ip)];
+      // both are let in and held together; bounded, so a failure cannot hang
+      for (let i = 0; i < 200 && stubPassword.checks - before < 2; i++) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(stubPassword.checks - before, 2, "both posts reached LubeLogger");
+    } finally {
+      release();
+      stubPassword.latch = undefined;
+    }
+    const answers = await Promise.all(posts.map(async (p) => ({ response: await p })));
+    const won = answers.filter((a) => a.response.status === 302);
+    const lost = answers.filter((a) => a.response.status === 400);
+    assert.equal(won.length, 1, "exactly one completes the login");
+    assert.equal(lost.length, 1);
+    assert.match(await lost[0].response.text(), /Login expired/);
+    assert.equal(stubPassword.cleanups, cleanups + 1, "the loser's upstream is cleaned up once");
+    await formTokens(claude, opened, won[0].response);
   });
 
   await check("a username's failures count however it is spaced or cased", async () => {

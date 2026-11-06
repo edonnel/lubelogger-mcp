@@ -648,6 +648,8 @@ await check("the real retired-method build revokes through OIDC", async () => {
     });
     assert.ok(r.ok, JSON.stringify(r.problems));
     built = await createApp(r.config);
+    // startup does not wait on a switched-off method's cleanup: the revoke arrives shortly after; bounded
+    for (let i = 0; i < 200 && idp.revoked.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
     assert.deepEqual(idp.revoked, [refreshToken]);
   } finally {
     await built?.close();

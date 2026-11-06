@@ -27,7 +27,7 @@ import {
   type LoginMethod,
   type RecheckResult,
 } from "./login-method.js";
-import { addressKey, FailureLimiter, MAX_FAILURES, MAX_KEY_LENGTH, WINDOW_MS } from "./rate-limit.js";
+import { addressKey, FailureLimiter, MAX_FAILURES, MAX_KEY_LENGTH } from "./rate-limit.js";
 import {
   BUTTON_LABEL,
   escapeHtml,
@@ -54,6 +54,9 @@ const EXPIRED_LINK = "This login link has expired, start again from Claude.";
 const EXPIRED_UNUSED = "expired after 90 days unused";
 
 const METHOD_OFF = "sign-in method switched off";
+
+/** Shown when a form post is refused only because enough attempts on its keys are still being checked. */
+export const STILL_CHECKING = "A sign-in is still being checked. Try again in a moment.";
 
 /** The longest username, password or key read from a sign-in form; anything longer is cut, never sent whole. */
 const MAX_FIELD_LENGTH = 512;
@@ -415,7 +418,9 @@ export class LoginProvider implements OAuthServerProvider {
     if (wait > 0 || busy) {
       // nothing is sent to LubeLogger, and this refusal is not itself counted as a failure
       log("sign-in refused: too many failed attempts");
-      showAgain(429, `Too many attempts. Try again in ${Math.ceil((wait || WINDOW_MS) / 60_000)} minutes.`);
+      // a lock names the minutes until the key is free; attempts still in flight may yet succeed, so no wait is known
+      if (wait > 0) showAgain(429, `Too many attempts. Try again in ${Math.ceil(wait / 60_000)} minutes.`);
+      else showAgain(429, STILL_CHECKING);
       return;
     }
 
@@ -666,7 +671,8 @@ export class LoginProvider implements OAuthServerProvider {
     try {
       for (const connection of this.store.connections()) {
         if (this.store.expired(connection)) await this.end(connection, EXPIRED_UNUSED);
-        else if (!this.methods.has(connection.method)) await this.end(connection, METHOD_OFF);
+        // a switched-off method's cleanup is not waited on: one that hangs must not hold up startup or the next purge
+        else if (!this.methods.has(connection.method)) await this.end(connection, METHOD_OFF, { awaitCleanup: false });
       }
     } catch (err) {
       log(`purging expired connections failed: ${err instanceof Error ? err.message : "unknown error"}`);
@@ -719,12 +725,17 @@ export class LoginProvider implements OAuthServerProvider {
     };
   }
 
-  /** Removes a connection, its access tokens and its upstream session. Only the first of two racing calls acts. */
-  private async end(connection: Connection, why: string): Promise<void> {
+  /**
+   * Removes a connection, its access tokens and its upstream session. Only the first of two racing calls acts.
+   * With `awaitCleanup: false` the upstream cleanup is started but not waited on; safeCleanup never throws.
+   */
+  private async end(connection: Connection, why: string, opts: { awaitCleanup?: boolean } = {}): Promise<void> {
     const removed = await this.store.removeConnection(connection.id);
     if (!removed) return;
     this.forget(connection.id);
-    await this.safeCleanup(connection.upstream, connection.person, connection.method);
+    const cleanup = this.safeCleanup(connection.upstream, connection.person, connection.method);
+    if (opts.awaitCleanup ?? true) await cleanup;
+    else void cleanup;
     log(`disconnected ${who(connection.person)} (${why})`);
   }
 

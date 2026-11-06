@@ -183,7 +183,9 @@ await check("lubelogger-key alone needs no shared key; anything else still does"
   assert.ok(validateConfig({ ...noKey, AUTH_METHODS: "lubelogger-key" }).ok);
   const both = validateConfig({ ...noKey, AUTH_METHODS: "lubelogger-key,lubelogger-password", LUBELOGGER_ALLOWED_USERS: "alice" });
   assert.ok(both.problems.some((p) => p.startsWith("LUBELOGGER_API_KEY")));
-  assert.equal(validateConfig({ ...noKey, MCP_AUTH_TOKEN: "x".repeat(24) }).ok, false);
+  const token = validateConfig({ ...noKey, MCP_AUTH_TOKEN: "x".repeat(24) });
+  assert.equal(token.ok, false);
+  assert.ok(token.problems.some((p) => p.startsWith("LUBELOGGER_API_KEY")), JSON.stringify(token.problems));
 });
 await check("all four methods can be on together", () => {
   const r = validateConfig({ ...ha, ...oidc, AUTH_METHODS: "homeassistant,oidc,lubelogger-password,lubelogger-key", LUBELOGGER_ALLOWED_USERS: "alice" });
