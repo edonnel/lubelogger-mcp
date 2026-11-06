@@ -3,7 +3,13 @@
 import assert from "node:assert/strict";
 import { createHash, createSign, generateKeyPairSync } from "node:crypto";
 import http from "node:http";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createApp } from "../dist/app.js";
 import { OidcLogin } from "../dist/auth/oidc.js";
+import { AuthStore } from "../dist/auth/store.js";
+import { validateConfig } from "../dist/config.js";
 
 const PUBLIC_URL = "https://mcp.example.com";
 const CLIENT_ID = "lubelogger-mcp";
@@ -24,14 +30,14 @@ async function check(name, fn) {
 // every secret value seen in the run, and every error message thrown, compared at the end
 const secrets = new Set([CLIENT_SECRET, "c1"]);
 const messages = [];
-async function throws(fn) {
+async function throws(fn, label = "") {
   try {
     await fn();
   } catch (err) {
     messages.push(err instanceof Error ? err.message : String(err));
     return err;
   }
-  assert.fail("expected a throw");
+  assert.fail(label ? `expected a throw: ${label}` : "expected a throw");
 }
 
 // ---------- the mock identity provider ----------
@@ -64,6 +70,8 @@ const idp = {
   issueRefresh: true,
   idTokenOnRefresh: true,
   counter: 0,
+  hang: false,
+  lastRefresh: undefined,
   tokenBodies: [],
   tokenAuth: [],
   revoked: [],
@@ -128,6 +136,8 @@ async function handle(req, res) {
     const body = await readBody(req);
     idp.tokenBodies.push(body);
     idp.tokenAuth.push(req.headers.authorization ?? "");
+    // a provider that takes the request and never answers
+    if (idp.hang) return;
     if (idp.challenge) {
       res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Basic realm="idp", error="invalid_client"' });
       return res.end(JSON.stringify({ error: "invalid_client" }));
@@ -154,7 +164,7 @@ async function handle(req, res) {
       answer.id_token = sign(claims, idp.signWith);
       secrets.add(answer.id_token);
     }
-    if (idp.issueRefresh) answer.refresh_token = newSecretValue("rt");
+    if (idp.issueRefresh) answer.refresh_token = idp.lastRefresh = newSecretValue("rt");
     return send(200, answer);
   }
   if (req.method === "POST" && url.pathname === "/revoke") {
@@ -204,6 +214,8 @@ function resetIdp() {
     tokenStatus: 200,
     tokenError: undefined,
     challenge: false,
+    hang: false,
+    lastRefresh: undefined,
     issueRefresh: true,
     idTokenOnRefresh: true,
     tokenBodies: [],
@@ -382,7 +394,7 @@ await check("a token with the wrong issuer, audience, nonce or signature is refu
     setup();
     const m = login();
     const { loginState } = await begin(m);
-    await throws(() => m.finish({ query: { code: "c1", state: loginState } }), what);
+    await throws(() => m.finish({ query: { code: "c1", state: loginState } }), `case: ${what}`);
   }
 });
 
@@ -479,6 +491,61 @@ await check("recheck refreshes and re-applies the allowlist", async () => {
   await startIdp();
 });
 
+await check("a refreshed ID token without a name keeps the stored name", async () => {
+  resetIdp();
+  idp.claims = { name: "Alice Example" };
+  const m = login({ allowedEmails: [], allowedSubjects: ["sub-alice"] });
+  const upstream = await signedIn(m);
+  assert.equal(upstream.name, "Alice Example");
+
+  idp.claims = { name: undefined, email: undefined, email_verified: false };
+  const r = await m.recheck(upstream);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.person.name, "Alice Example");
+  assert.equal(r.upstream.name, "Alice Example");
+});
+
+await check("a refused refreshed ID token revokes the rotated refresh token", async () => {
+  resetIdp();
+  const m = login();
+  const upstream = await signedIn(m);
+
+  idp.claims = { email: "alice@elsewhere.example.com" };
+  const r = await m.recheck(upstream);
+  assert.deepEqual(r, { ok: false, reason: "refused" });
+  assert.ok(idp.lastRefresh && idp.lastRefresh !== upstream.refreshToken, "the provider rotated the token");
+  assert.deepEqual(idp.revoked, [idp.lastRefresh]);
+
+  // a provider that does not rotate has nothing new to revoke
+  resetIdp();
+  const m2 = login();
+  const up2 = await signedIn(m2);
+  idp.issueRefresh = false;
+  idp.claims = { sub: "sub-carol" };
+  assert.deepEqual(await m2.recheck(up2), { ok: false, reason: "refused" });
+  assert.deepEqual(idp.revoked, []);
+});
+
+await check("the ID token signature is checked on refresh", async () => {
+  resetIdp();
+  const m = login();
+  const upstream = await signedIn(m);
+  idp.signWith = otherKey.privateKey;
+  const r = await m.recheck(upstream);
+  assert.equal(r.ok, false, JSON.stringify(r));
+});
+
+await check("a provider that never answers times out as unavailable", async () => {
+  resetIdp();
+  const m = login({ timeoutS: 0.3 });
+  const upstream = await signedIn(m);
+  idp.hang = true;
+  assert.deepEqual(await m.recheck(upstream), { ok: false, reason: "unavailable" });
+  idp.hang = false;
+  // the hung request is dropped with the connection, not left open
+  idp.server.closeAllConnections();
+});
+
 await check("without a refresh token, recheck is ok until the ID token expires, then refused", async () => {
   resetIdp();
   idp.issueRefresh = false;
@@ -545,6 +612,47 @@ await check("an http issuer other than localhost is refused at construction", as
   await throws(async () => login({ issuer: "http://idp.example.com" }));
   login({ issuer: "https://idp.example.com" });
   login({ issuer: "http://localhost:9999" });
+});
+
+await check("the real retired-method build revokes through OIDC", async () => {
+  resetIdp();
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oidc-retired-"));
+  let built;
+  try {
+    const refreshToken = "rt-seeded-alice";
+    secrets.add(refreshToken);
+    const store = await AuthStore.open(dir);
+    await store.putConnection({
+      id: "conn-alice",
+      clientId: "client-1",
+      method: "oidc",
+      person: { id: "sub-alice", name: "Alice" },
+      upstream: { sub: "sub-alice", name: "Alice", refreshToken, idTokenExpiresAt: Date.now() + 3600_000 },
+      refreshHash: "hash-alice",
+      lastUsedAt: Date.now(),
+    });
+
+    // the homeassistant method only, with the OIDC settings still present and no injected retiredMethods
+    const r = validateConfig({
+      LUBELOGGER_URL: "http://lubelogger.example.com:8080",
+      LUBELOGGER_API_KEY: "test-api-key",
+      AUTH_METHODS: "homeassistant",
+      PUBLIC_URL: PUBLIC_URL,
+      HOME_ASSISTANT_PUBLIC_URL: "https://ha.example.com",
+      HOME_ASSISTANT_URL: "http://ha.example.com:8123",
+      OIDC_ISSUER: issuer(),
+      OIDC_CLIENT_ID: CLIENT_ID,
+      OIDC_CLIENT_SECRET: CLIENT_SECRET,
+      OIDC_ALLOWED_EMAILS: "alice@example.com",
+      DATA_DIR: dir,
+    });
+    assert.ok(r.ok, JSON.stringify(r.problems));
+    built = await createApp(r.config);
+    assert.deepEqual(idp.revoked, [refreshToken]);
+  } finally {
+    await built?.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 await check("nothing secret is ever in an error message", async () => {

@@ -25,6 +25,8 @@ export type OidcOptions = {
   /** Extra authorization query, e.g. "access_type=offline&prompt=consent". */
   authParams?: string;
   now?: () => number;
+  /** Seconds to wait for the provider before giving up; 10 when unset. */
+  timeoutS?: number;
 };
 
 type Upstream = { sub: string; name: string; refreshToken?: string; idTokenExpiresAt: number };
@@ -32,9 +34,6 @@ type Upstream = { sub: string; name: string; refreshToken?: string; idTokenExpir
 type Pending = { verifier: string; nonce: string; createdAt: number };
 
 type Claims = Record<string, unknown>;
-
-/** The provider answered and said no: a 4xx from its token endpoint. */
-class OidcRejected extends Error {}
 
 function isLocalHttp(url: URL): boolean {
   return url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1");
@@ -83,12 +82,13 @@ function describe(err: unknown, what: string): string {
   return `${what}: failed`;
 }
 
-function personFrom(claims: Claims, sub: string): Person {
+/** The name from the claims; failing that the name already stored for this person, and last the subject. */
+function personFrom(claims: Claims, sub: string, fallbackName?: string): Person {
   for (const key of ["name", "preferred_username", "email"]) {
     const v = claims[key];
     if (typeof v === "string" && v.trim()) return { id: sub, name: v };
   }
-  return { id: sub, name: sub };
+  return { id: sub, name: fallbackName || sub };
 }
 
 export class OidcLogin implements LoginMethod {
@@ -103,6 +103,7 @@ export class OidcLogin implements LoginMethod {
   private readonly groupsClaim: string;
   private readonly authParams: URLSearchParams;
   private readonly now: () => number;
+  private readonly timeoutS: number;
   private readonly pending = new Map<string, Pending>();
   private configuration: Promise<client.Configuration> | undefined;
 
@@ -122,6 +123,7 @@ export class OidcLogin implements LoginMethod {
     this.groupsClaim = opts.groupsClaim;
     this.authParams = new URLSearchParams(opts.authParams ?? "");
     this.now = opts.now ?? Date.now;
+    this.timeoutS = opts.timeoutS ?? TIMEOUT_S;
   }
 
   async start(loginState: string, res: express.Response): Promise<void> {
@@ -240,8 +242,18 @@ export class OidcLogin implements LoginMethod {
       return { ok: true, upstream: { ...old, refreshToken: nextRefresh }, person: { id: sub, name } };
     }
 
-    if (claims.sub !== sub || !this.allowed(claims)) return { ok: false, reason: "refused" };
-    const person = personFrom(claims, sub);
+    if (claims.sub !== sub || !this.allowed(claims)) {
+      // the provider may have rotated the token on this very refresh; the new one would otherwise stay live
+      if (tokens.refresh_token && tokens.refresh_token !== refreshToken) {
+        try {
+          await this.cleanup({ refreshToken: tokens.refresh_token });
+        } catch {
+          // best effort: the refusal stands regardless
+        }
+      }
+      return { ok: false, reason: "refused" };
+    }
+    const person = personFrom(claims, sub, name);
     const next: Upstream = { sub, name: person.name, refreshToken: nextRefresh, idTokenExpiresAt: (claims.exp as number) * 1000 };
     return { ok: true, upstream: next, person };
   }
@@ -283,7 +295,7 @@ export class OidcLogin implements LoginMethod {
         this.clientId,
         this.clientSecret ? { client_secret: this.clientSecret } : undefined,
         this.clientSecret ? client.ClientSecretBasic(this.clientSecret) : client.None(),
-        { execute, timeout: TIMEOUT_S },
+        { execute, timeout: this.timeoutS },
       );
       this.configuration = p;
       p.catch(() => {

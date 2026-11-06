@@ -194,6 +194,15 @@ await check("no OIDC setting value appears in any problem", () => {
   assert.equal(r.ok, false);
   assert.ok(r.problems.every((p) => !p.includes("SECRET-PLANTED-31")));
 });
+await check("OIDC_AUTH_PARAMS may not set protocol parameters", () => {
+  for (const name of ["client_id", "response_type", "response_mode", "request", "request_uri"]) {
+    const r = validateConfig({ ...oidc, OIDC_AUTH_PARAMS: `${name}=x`, AUTH_METHODS: "oidc" });
+    assert.equal(r.ok, false, name);
+    assert.ok(r.problems.some((p) => p.includes("OIDC_AUTH_PARAMS") && p.includes(name)), `${name}: ${r.problems}`);
+  }
+  const ok = validateConfig({ ...oidc, OIDC_AUTH_PARAMS: "access_type=offline&prompt=consent", AUTH_METHODS: "oidc" });
+  assert.ok(ok.ok, JSON.stringify(ok.problems));
+});
 await check("list settings are split on commas, trimmed, empties dropped", () => {
   const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: " a@example.com, ,b@example.com,", AUTH_METHODS: "oidc" });
   assert.deepEqual(r.config.OIDC_ALLOWED_EMAILS, ["a@example.com", "b@example.com"]);

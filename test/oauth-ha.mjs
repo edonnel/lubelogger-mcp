@@ -929,21 +929,23 @@ await startTwo();
   });
 
   await check("a login state locked to one method refuses a second", async () => {
+    const baseline = stubOidc.started;
     const { loginState, cookie } = await openApproval(claude, "alice");
     assert.equal((await approve(loginState, cookie, {}, "homeassistant")).status, 302);
     const second = await approve(loginState, cookie, {}, "oidc");
     assert.equal(second.status, 400);
     assert.match(await second.text(), /Login expired/);
-    assert.equal(stubOidc.started, 0);
+    assert.equal(stubOidc.started, baseline, "the second method was never started");
   });
 
   await check("the same person through both methods gets two connections, neither replaced", async () => {
     const haBefore = stub.cleaned.length;
     const oidcBefore = stubOidc.cleaned.length;
+    const baseline = stubOidc.started;
     const viaHa = await login(claude, "alice", beginWith("homeassistant"));
     stubOidc.next = "alice";
     viaOidc = await login(claude, "alice", beginWith("oidc"));
-    assert.equal(stubOidc.started, 1);
+    assert.equal(stubOidc.started, baseline + 1);
 
     const r1 = await refresh(claude, viaHa.refresh_token);
     assert.equal(r1.status, 200);
@@ -1008,6 +1010,47 @@ await check("with the identity provider down, the server still starts", async ()
   } finally {
     if (running) await stop();
     await fs.rm(downDir, { recursive: true, force: true });
+  }
+});
+
+await check("cleanup that throws is logged, not raised", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-throws-"));
+  const throwing = {
+    ...stub,
+    cleaned: [],
+    async cleanup() {
+      throw new Error("the provider is down");
+    },
+  };
+  try {
+    await startWith(config({ DATA_DIR: dir }), { loginMethods: { homeassistant: throwing }, now });
+    const client = await register();
+    const tokens = await login(client, "alice");
+    assert.equal((await storedConnections(dir)).length, 1);
+    const mark = logs.length;
+    const r = await form("/revoke", { token: tokens.refresh_token, client_id: client.client_id });
+    assert.equal(r.status, 200);
+    assert.deepEqual(await storedConnections(dir), [], "the connection is gone");
+    assert.ok(logs.slice(mark).some((l) => l.includes("cleanup for") && l.includes("failed")));
+  } finally {
+    if (running) await stop();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+await check("markup in OIDC_DISPLAY_NAME is escaped on the button", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-markup-"));
+  try {
+    await startWith(twoConfig({ OIDC_DISPLAY_NAME: "<b>Acme</b>", DATA_DIR: dir }), {
+      loginMethods: { homeassistant: stub, oidc: stubOidc },
+      now,
+    });
+    const { html } = await openApproval(await register(), "alice");
+    assert.ok(html.includes("Continue with &lt;b&gt;Acme&lt;/b&gt;"), "the name is escaped");
+    assert.ok(!html.includes("<b>"), "no markup from the name");
+  } finally {
+    if (running) await stop();
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });
 

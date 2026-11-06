@@ -23,6 +23,9 @@ const schema = z.object({
 /** Shortest path segment accepted as a secret when there is no bearer token: 32 hex characters is 128 bits. */
 const MIN_SECRET_SEGMENT = 32;
 
+/** Authorization parameters the server sets itself, so OIDC_AUTH_PARAMS may not carry them. */
+export const RESERVED_AUTH_PARAMS = ["client_id", "response_type", "response_mode", "request", "request_uri"] as const;
+
 /** Every sign-in method the server knows by name. */
 export const METHOD_NAMES = ["homeassistant", "oidc", "lubelogger-password", "lubelogger-key"] as const;
 export type MethodName = (typeof METHOD_NAMES)[number];
@@ -171,6 +174,13 @@ function resolveMethods(c: ResolveInput): { methods: MethodName[]; problems: { p
 // With methods: the endpoint is fixed and the sign-in is the credential.
 const checkedSchema = fullSchema
   .superRefine((c, ctx) => {
+    if (c.OIDC_AUTH_PARAMS !== undefined) {
+      const given = new URLSearchParams(c.OIDC_AUTH_PARAMS);
+      for (const name of RESERVED_AUTH_PARAMS)
+        if (given.has(name))
+          ctx.addIssue({ code: "custom", path: ["OIDC_AUTH_PARAMS"], message: `must not set ${name} (the server sets it itself)` });
+    }
+
     const { methods, problems } = resolveMethods(c);
     if (problems.length > 0) {
       for (const p of problems) ctx.addIssue({ code: "custom", path: [p.path], message: p.message });
