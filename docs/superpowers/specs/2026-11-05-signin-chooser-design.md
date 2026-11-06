@@ -140,3 +140,13 @@ This replaces the approved design's three releases. Each step can be tested and 
   - the long `.env.example` line;
   - `LUBELOGGER_ALLOWED_USERS` sitting inside the OIDC settings block;
   - the launcher's `is_set` accepting whitespace.
+
+## Left after the follow-ups (from their reviews; none lets anyone in or blocks startup)
+
+- When a refreshed ID token is refused, the error from revoking the rotated refresh token is swallowed without a log line.
+- A refreshed ID token with a bad signature reads as "unavailable", so the connection is kept and retried rather than ended; its test asserts only `ok === false`.
+- LubeLogger's no-credential probe treats a 404 or 429 as "login on". The credentialed call then answers unavailable, so the outcome is right at the cost of one extra request.
+- `close()` does not wait for upstream cleanups that the startup purge started without waiting, so a shutdown within seconds of a purge can drop a revoke.
+- The purge starts every switched-off connection's cleanup at once, with no limit.
+- Tests: the client-hint test uses the mock's global status override; the retired-method revoke test polls a fixed 2 s.
+- `.env.example`: the OIDC allowlist comments are terse.
