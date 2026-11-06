@@ -180,7 +180,7 @@ The sign-in screen has one button per method that is switched on. Only Home Assi
 
 **Switching a method off.** While the server still has other methods on, connections made with a method that has been switched off are removed, at the next start or at their next refresh, whichever comes first. If the switched-off method's settings are still in place, the server also revokes its sessions at the source (for Home Assistant the refresh token, for OpenID Connect the refresh token when the provider has a revocation endpoint), so there is nothing left to delete there. If the settings are gone, it cannot reach the source and does not try, so delete those sessions yourself. For Home Assistant that is Profile, then Refresh tokens. If the method you switch off is the only one on, the server goes back to token mode, which leaves the sign-in data alone: existing connections stay in the data file and work again if the method is switched back on within 90 days. The add-on will not start with no method switched on.
 
-The startup log says which methods are on: `auth homeassistant`, `auth homeassistant,oidc` with both methods on, or `auth token` in token mode.
+The startup log says which methods are on, for example `lubelogger-mcp listening on http://0.0.0.0:3000, endpoint /mcp, auth homeassistant,oidc`, or ends in `auth token` in token mode.
 
 ### Upgrading the add-on from 0.4 to 0.5
 
@@ -265,7 +265,7 @@ Two more methods let people sign in with LubeLogger itself, with no Home Assista
 - `lubelogger-password`: the person types their LubeLogger username and password.
 - `lubelogger-key`: the person pastes their own LubeLogger API key.
 
-```
+```env
 AUTH_METHODS=lubelogger-password,lubelogger-key
 PUBLIC_URL=https://mcp.example.com
 LUBELOGGER_ALLOWED_USERS=alice,bob

@@ -346,6 +346,16 @@ await check("lubelogger_key alone needs no lubelogger_api_key; anything else sti
   assert.ok(planted.every((p) => !p.includes("SECRET-PLANTED-91")));
 });
 
+check("whitespace-only options count as unset", () => {
+  assert.ok(check_options({ ...addonOptions, public_url: "   " }).some((p) => p.includes("public_url")));
+  assert.equal(buildEnv({ ...addonOptions, oidc_issuer: "  " }).OIDC_ISSUER, undefined);
+});
+
+check("oidc alone does not need home_assistant_public_url", () => {
+  const options = { ...addonOptions, homeassistant: false, oidc: true, oidc_issuer: "https://idp.example.com", oidc_client_id: "x", oidc_allowed_emails: "alice@example.com", home_assistant_public_url: undefined };
+  assert.deepEqual(check_options(options), []);
+});
+
 if (failed) {
   console.error(`${failed} check(s) failed`);
   process.exit(1);

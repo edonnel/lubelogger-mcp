@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const STATE_DIR = "/data/oauth";
 
-/** True for an option that holds text. */
+/** True for an option that holds text other than spaces. */
 function is_set(value) {
-	return typeof value === "string" && value !== "";
+	return typeof value === "string" && value.trim() !== "";
 }
 
 /**
@@ -98,8 +98,8 @@ export function buildEnv(options) {
 		OIDC_AUTH_PARAMS: options.oidc_auth_params,
 	};
 
-	// unset or empty values are left out so the server's own configuration check names what is missing
-	return Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === "string" && v !== ""));
+	// unset, empty and whitespace-only values are left out so the server's own configuration check names what is missing
+	return Object.fromEntries(Object.entries(env).filter(([, v]) => is_set(v)));
 }
 
 /** Looks up the uid and gid of a user in /etc/passwd. */
