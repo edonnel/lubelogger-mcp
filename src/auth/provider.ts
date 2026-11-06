@@ -21,13 +21,12 @@ import type { MethodName } from "../config.js";
 import {
   isFormMethod,
   type AnyLoginMethod,
-  type FormCheckResult,
-  type FormFields,
   type FormLoginMethod,
   type LoginMethod,
   type RecheckResult,
 } from "./login-method.js";
-import { addressKey, FailureLimiter, MAX_FAILURES, MAX_KEY_LENGTH } from "./rate-limit.js";
+import { FormLoginGate, STILL_CHECKING } from "./form-login.js";
+import { FailureLimiter } from "./rate-limit.js";
 import {
   BUTTON_LABEL,
   escapeHtml,
@@ -55,11 +54,8 @@ const EXPIRED_UNUSED = "expired after 90 days unused";
 
 const METHOD_OFF = "sign-in method switched off";
 
-/** Shown when a form post is refused only because enough attempts on its keys are still being checked. */
-export const STILL_CHECKING = "A sign-in is still being checked. Try again in a moment.";
-
-/** The longest username, password or key read from a sign-in form; anything longer is cut, never sent whole. */
-const MAX_FIELD_LENGTH = 512;
+// defined beside the form gate that returns it; re-exported because the sign-in screen's tests import it from here
+export { STILL_CHECKING };
 
 /** The method whose connections act with the person's own LubeLogger API key. */
 const KEY_METHOD: MethodName = "lubelogger-key";
@@ -186,11 +182,8 @@ export class LoginProvider implements OAuthServerProvider {
   // switched off but still configured: used only to revoke old connections' upstream sessions
   private readonly retired: ReadonlyMap<MethodName, AnyLoginMethod>;
 
-  // failed form sign-ins, by address and by username
-  private readonly limiter: FailureLimiter;
-
-  // form sign-ins being checked right now, by limiter key; a key is removed when its count drops to 0
-  private readonly inFlight = new Map<string, number>();
+  // refuses, runs and counts form sign-ins (failed ones by address and by username)
+  private readonly formGate: FormLoginGate;
 
   private lastPurge: number;
 
@@ -214,7 +207,7 @@ export class LoginProvider implements OAuthServerProvider {
     this.allowedRedirectHosts = opts.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS;
     this.labels = opts.labels ?? {};
     this.retired = opts.retired ?? new Map();
-    this.limiter = opts.limiter ?? new FailureLimiter(now);
+    this.formGate = new FormLoginGate(opts.limiter ?? new FailureLimiter(now));
     this.publicOrigin = opts.publicUrl ? new URL(opts.publicUrl).origin : undefined;
     this.lastPurge = this.now();
     this.clientsStore = {
@@ -393,57 +386,25 @@ export class LoginProvider implements OAuthServerProvider {
     name: MethodName,
     method: FormLoginMethod,
   ): Promise<void> {
-    const body = (req.body ?? {}) as Record<string, unknown>;
-    const field = (key: string) => {
-      const value = body[key];
-      return typeof value === "string" ? value.slice(0, MAX_FIELD_LENGTH) : "";
-    };
-    // each form fills only its own fields; the username is the only one ever shown again
-    const username = method.form === "password" ? field("username") : undefined;
-    const fields: FormFields =
-      method.form === "password" ? { username, password: field("password") } : { apiKey: field("apiKey") };
+    const { username, outcome } = await this.formGate.attempt(req, method);
     const showAgain = (status: number, message: string) =>
       this.showScreen(res, status, loginState, entry, { form: method.form, message, username });
 
-    // the address always, and the username for the password form: either one being locked refuses the attempt
-    // cut as the limiter cuts them, so the in-flight count and the limiter agree on what a key is
-    // an IPv6 address counts by its /64, and the username ignores case and surrounding spaces (for the key only)
-    const keys = [addressKey(req.ip)];
-    const userKey = username?.trim().toLowerCase();
-    if (userKey) keys.push(`user:${userKey}`);
-    for (const [i, key] of keys.entries()) keys[i] = key.slice(0, MAX_KEY_LENGTH);
-    const wait = this.limiter.lockedFor(keys);
-    // attempts still being checked count too: otherwise a burst of posts all pass before any failure is recorded
-    const busy = keys.some((key) => (this.inFlight.get(key) ?? 0) + this.limiter.failureCount(key) >= MAX_FAILURES);
-    if (wait > 0 || busy) {
-      // nothing is sent to LubeLogger, and this refusal is not itself counted as a failure
+    if ("locked" in outcome) {
       log("sign-in refused: too many failed attempts");
-      // a lock names the minutes until the key is free; attempts still in flight may yet succeed, so no wait is known
-      if (wait > 0) showAgain(429, `Too many attempts. Try again in ${Math.ceil(wait / 60_000)} minutes.`);
-      else showAgain(429, STILL_CHECKING);
+      showAgain(429, outcome.locked);
       return;
     }
-
-    let result: FormCheckResult;
-    for (const key of keys) this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1);
-    try {
-      result = await method.check(fields);
-    } catch {
+    if ("failed" in outcome) {
       // the error is left out of the log: it could carry what was typed
       log("sign-in check failed");
       showAgain(503, "The sign-in could not be checked. Try again shortly.");
       return;
-    } finally {
-      // runs before the failure below is recorded, with no await between, so no attempt is counted twice or not at all
-      for (const key of keys) {
-        const left = (this.inFlight.get(key) ?? 1) - 1;
-        if (left > 0) this.inFlight.set(key, left);
-        else this.inFlight.delete(key);
-      }
     }
+    const result = outcome;
 
     if ("invalid" in result) {
-      this.limiter.fail(keys);
+      // the gate has already counted the failure
       log(username === undefined ? "sign-in failed with an API key" : `sign-in failed for ${JSON.stringify(username.slice(0, 60))}`);
       showAgain(400, result.invalid);
       return;
