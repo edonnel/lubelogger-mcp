@@ -61,6 +61,8 @@ export class LubeLoggerClient {
     private readonly baseUrl: string,
     private readonly apiKey: string,
     private readonly timeoutMs: number,
+    /** Whose key this is, which decides what an error tells the reader to check. */
+    private readonly keySource: "shared" | "connection" = "shared",
   ) {}
 
   private async request(
@@ -110,7 +112,9 @@ export class LubeLoggerClient {
         data && typeof data === "object" && "message" in data ? String((data as OperationResponse).message) : text.slice(0, 300);
       const hint =
         res.status === 401 || res.status === 403
-          ? " (check LUBELOGGER_API_KEY and that the key's role allows adding records: Editor or higher)"
+          ? this.keySource === "connection"
+            ? " (check that your LubeLogger API key still exists and that its role allows adding records: Editor or higher)"
+            : " (check LUBELOGGER_API_KEY and that the key's role allows adding records: Editor or higher)"
           : "";
       throw new LubeLoggerError(
         `LubeLogger returned HTTP ${res.status}: ${detail || res.statusText}${hint}`,

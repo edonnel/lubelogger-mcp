@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { LubeLoggerKeyLogin, LubeLoggerPasswordLogin } from "../dist/auth/lubelogger-login.js";
+import { LubeLoggerClient } from "../dist/lubelogger.js";
 
 const SECRETS = ["pw-alice", "pw-bob", "key-alice"];
 const LOGIN_OFF = /LubeLogger's own login is turned off/;
@@ -47,6 +48,9 @@ const mock = {
   keys: new Map([["key-alice", "alice"]]),
   authOff: false,
   status: undefined,
+  // the status whoami answers a request carrying credentials, and whether such a request is dropped at the socket
+  credentialedStatus: undefined,
+  dropCredentialed: false,
   requests: [],
   reset() {
     this.keys = new Map([
@@ -56,6 +60,8 @@ const mock = {
     ]);
     this.authOff = false;
     this.status = undefined;
+    this.credentialedStatus = undefined;
+    this.dropCredentialed = false;
     this.requests = [];
   },
 };
@@ -82,6 +88,9 @@ const server = http.createServer((req, res) => {
   if (mock.status) return send(mock.status, { message: "boom" });
   if (req.url !== "/api/whoami") return send(404);
   if (mock.authOff) return send(200, { username: "admin", emailAddress: "", isAdmin: "True", isRoot: "True" });
+  const credentialed = req.headers.authorization !== undefined || req.headers["x-api-key"] !== undefined;
+  if (credentialed && mock.dropCredentialed) return req.socket.destroy();
+  if (credentialed && mock.credentialedStatus) return send(mock.credentialedStatus);
   const user = whoamiUser(req);
   if (!user) return send(401);
   send(200, { username: user, emailAddress: `${user}@example.com`, isAdmin: "False", isRoot: "False" });
@@ -231,6 +240,73 @@ await check("users named \"rejected\" and \"unavailable\" sign in like anyone el
     assert.deepEqual(k, { person, upstream });
     assert.deepEqual(await key().recheck(upstream), { ok: true, upstream, person });
   }
+});
+
+await check("only a 401 is a wrong password", async () => {
+  mock.reset();
+  for (const status of [404, 429, 403]) {
+    mock.credentialedStatus = status;
+    const r = await run(() => password().check({ username: "alice", password: "pw-alice" }));
+    assert.deepEqual(r, { unavailable: UNAVAILABLE }, `status ${status}`);
+  }
+  mock.credentialedStatus = 401;
+  const r = await run(() => password().check({ username: "alice", password: "pw-alice" }));
+  assert.deepEqual(r, { invalid: "That username or password is wrong." });
+});
+
+await check("a key connection survives a 404 or 429 on refresh", async () => {
+  mock.reset();
+  const upstream = { username: "alice", apiKey: "key-alice" };
+  for (const status of [404, 429]) {
+    mock.credentialedStatus = status;
+    assert.deepEqual(await key().recheck(upstream), { ok: false, reason: "unavailable" }, `status ${status}`);
+  }
+  mock.credentialedStatus = 401;
+  assert.deepEqual(await key().recheck(upstream), { ok: false, reason: "refused" });
+});
+
+await check("a key a header can't carry is not valid", async () => {
+  mock.reset();
+  for (const apiKey of ["key\n", "clé"]) {
+    const r = await run(() => key().check({ apiKey }));
+    assert.deepEqual(r, { invalid: "That API key is not valid." });
+    assert.deepEqual(await key().recheck({ username: "alice", apiKey }), { ok: false, reason: "refused" });
+  }
+  assert.equal(mock.requests.length, 0);
+});
+
+await check("a colon in the username is a wrong password without asking LubeLogger", async () => {
+  mock.reset();
+  const r = await run(() => password().check({ username: "al:ice", password: "x" }));
+  assert.deepEqual(r, { invalid: "That username or password is wrong." });
+  assert.equal(mock.requests.length, 0);
+});
+
+await check("the probe succeeds but the credentialed call fails", async () => {
+  mock.reset();
+  mock.dropCredentialed = true;
+  assert.deepEqual(await run(() => password().check({ username: "alice", password: "pw-alice" })), { unavailable: UNAVAILABLE });
+  assert.deepEqual(await run(() => key().check({ apiKey: "key-alice" })), { unavailable: UNAVAILABLE });
+  assert.ok(mock.requests.some((q) => q.headers.authorization !== undefined));
+});
+
+await check("the client's 401 hint names the key the request used", async () => {
+  mock.reset();
+  mock.status = 401;
+  const hintFor = async (...extra) => {
+    try {
+      await new LubeLoggerClient(URL_OK, "key-alice", 2000, ...extra).listVehicles();
+    } catch (err) {
+      messages.push(err.message);
+      return err.message;
+    }
+    assert.fail("expected an error");
+  };
+  const own = await hintFor("connection");
+  assert.ok(own.includes("your LubeLogger API key"), own);
+  assert.ok(!own.includes("LUBELOGGER_API_KEY"), own);
+  assert.ok((await hintFor()).includes("LUBELOGGER_API_KEY"));
+  assert.ok((await hintFor("shared")).includes("LUBELOGGER_API_KEY"));
 });
 
 await check("no password or key appears in any result message or thrown error", async () => {

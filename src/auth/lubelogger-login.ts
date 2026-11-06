@@ -67,8 +67,9 @@ class Whoami {
 }
 
 /**
- * Sorts a whoami answer for credentials into the person, "rejected" (a 4xx: LubeLogger said no) or
- * "unavailable" (a 5xx, a 200 without a username, or no answer at all).
+ * Sorts a whoami answer for credentials into the person, "rejected" (a 401: LubeLogger said these credentials are
+ * wrong) or "unavailable" (any other status, a 200 without a username, or no answer at all). A 404, 403 or 429 says
+ * nothing about the credentials, so it is never taken for a wrong password or a deleted key.
  */
 async function identify(
   whoami: Whoami,
@@ -81,7 +82,7 @@ async function identify(
     return { unavailable: true };
   }
   if (answer.status === 200) return answer.username ? { user: answer.username } : { unavailable: true };
-  return answer.status >= 400 && answer.status < 500 ? { rejected: true } : { unavailable: true };
+  return answer.status === 401 ? { rejected: true } : { unavailable: true };
 }
 
 export type LubeLoggerPasswordOptions = WhoamiOptions & {
@@ -137,6 +138,9 @@ export class LubeLoggerPasswordLogin implements FormLoginMethod {
 
 export type LubeLoggerKeyOptions = WhoamiOptions;
 
+// a key goes in a request header, so only visible ASCII can carry it
+const HEADER_SAFE_KEY = /^[!-~]+$/;
+
 /**
  * A person's own LubeLogger API key. Any LubeLogger user may connect with one, and the connection then
  * acts with that key, so it never gains more than the person already has. A refresh asks whoami again.
@@ -151,7 +155,7 @@ export class LubeLoggerKeyLogin implements FormLoginMethod {
 
   async check(fields: FormFields): Promise<FormCheckResult> {
     const apiKey = fields.apiKey;
-    if (!apiKey) return { invalid: WRONG_KEY };
+    if (!apiKey || !HEADER_SAFE_KEY.test(apiKey)) return { invalid: WRONG_KEY };
 
     const off = await this.whoami.loginIsOff();
     if (off === "unavailable") return { unavailable: UNAVAILABLE };
@@ -166,7 +170,7 @@ export class LubeLoggerKeyLogin implements FormLoginMethod {
 
   async recheck(upstream: Record<string, unknown>): Promise<RecheckResult> {
     const { username, apiKey } = upstream;
-    if (typeof username !== "string" || !username || typeof apiKey !== "string" || !apiKey)
+    if (typeof username !== "string" || !username || typeof apiKey !== "string" || !HEADER_SAFE_KEY.test(apiKey))
       return { ok: false, reason: "refused" };
 
     const off = await this.whoami.loginIsOff();

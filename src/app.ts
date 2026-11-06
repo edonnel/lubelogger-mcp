@@ -64,7 +64,8 @@ export async function createApp(
    */
   function clientFor(auth?: AuthInfo): LubeLoggerClient {
     const key = auth?.extra?.lubeloggerKey;
-    if (typeof key === "string" && key) return new LubeLoggerClient(config.LUBELOGGER_URL, key, config.REQUEST_TIMEOUT_MS);
+    if (typeof key === "string" && key)
+      return new LubeLoggerClient(config.LUBELOGGER_URL, key, config.REQUEST_TIMEOUT_MS, "connection");
     // an API-key connection must never fall back to the shared key, which can see more than the person can
     if (auth?.extra?.method === "lubelogger-key") throw new Error("this connection has no LubeLogger API key");
     if (!client) throw new Error("no shared LubeLogger API key is configured");
