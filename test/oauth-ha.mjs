@@ -1428,6 +1428,7 @@ async function formTokens(client, opened, r) {
     }
     assert.equal(sixth.status, 429);
     assert.equal(errorOf(await sixth.text()), STILL_CHECKING);
+    assert.ok(logs.some((l) => l.includes("sign-in refused: another attempt is still being checked")));
     assert.equal(stubPassword.checks - before, 5, "the sixth never reached LubeLogger");
     for (const r of await Promise.all(held)) assert.equal(r.status, 400);
     // the five failures age out for the checks after this one
@@ -1454,7 +1455,9 @@ async function formTokens(client, opened, r) {
 
     clock = freeAt - 1;
     const stillLocked = await openApproval(claude, "alice");
-    assert.equal((await passwordForm(stillLocked, "alice", RIGHT_PASSWORD, ip)).status, 429);
+    const almost = await passwordForm(stillLocked, "alice", RIGHT_PASSWORD, ip);
+    assert.equal(almost.status, 429);
+    assert.equal(errorOf(await almost.text()), "Too many attempts. Try again in 1 minute.");
     assert.equal(stubPassword.checks, checks, "LubeLogger is not asked while it is locked");
 
     clock = freeAt;

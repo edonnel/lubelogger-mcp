@@ -391,7 +391,7 @@ export class LoginProvider implements OAuthServerProvider {
       this.showScreen(res, status, loginState, entry, { form: method.form, message, username });
 
     if ("locked" in outcome) {
-      log("sign-in refused: too many failed attempts");
+      log(outcome.locked === STILL_CHECKING ? "sign-in refused: another attempt is still being checked" : "sign-in refused: too many failed attempts");
       showAgain(429, outcome.locked);
       return;
     }
@@ -401,37 +401,36 @@ export class LoginProvider implements OAuthServerProvider {
       showAgain(503, "The sign-in could not be checked. Try again shortly.");
       return;
     }
-    const result = outcome;
 
-    if ("invalid" in result) {
+    if ("invalid" in outcome) {
       // the gate has already counted the failure
       log(username === undefined ? "sign-in failed with an API key" : `sign-in failed for ${JSON.stringify(username.slice(0, 60))}`);
-      showAgain(400, result.invalid);
+      showAgain(400, outcome.invalid);
       return;
     }
-    if ("unavailable" in result) {
+    if ("unavailable" in outcome) {
       log("sign-in check could not reach LubeLogger");
-      showAgain(503, result.unavailable);
+      showAgain(503, outcome.unavailable);
       return;
     }
 
     // another method, or another post of this form, may have used the state while LubeLogger was asked
     if (this.states.get(loginState) !== entry || entry.method !== undefined) {
-      if ("upstream" in result) await this.safeCleanup(result.upstream, result.person, name);
+      if ("upstream" in outcome) await this.safeCleanup(outcome.upstream, outcome.person, name);
       page(res, 400, "Login expired", EXPIRED_LINK);
       return;
     }
     this.states.delete(loginState);
     clearLoginCookie(res);
 
-    if ("refused" in result) {
+    if ("refused" in outcome) {
       // the message can hold a username LubeLogger supplied: shown escaped, and never logged as it is
-      log(`sign-in refused for ${JSON.stringify((result.person?.name ?? username ?? "unknown").slice(0, 60))}`);
-      page(res, 403, "Not allowed", result.refused);
+      log(`sign-in refused for ${JSON.stringify((outcome.person?.name ?? username ?? "unknown").slice(0, 60))}`);
+      page(res, 403, "Not allowed", outcome.refused);
       return;
     }
     entry.method = name;
-    this.completeLogin(res, entry, name, result.person, result.upstream);
+    this.completeLogin(res, entry, name, outcome.person, outcome.upstream);
   }
 
   /**

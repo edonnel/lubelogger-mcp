@@ -174,11 +174,11 @@ function resolveMethods(c: ResolveInput): { methods: MethodName[]; problems: { p
 // With methods: the endpoint is fixed and the sign-in is the credential.
 const checkedSchema = fullSchema
   .superRefine((c, ctx) => {
-    if (c.OIDC_AUTH_PARAMS !== undefined) {
+    if (c.OIDC_AUTH_PARAMS !== undefined && resolveMethods(c).methods.includes("oidc")) {
       const given = new URLSearchParams(c.OIDC_AUTH_PARAMS);
       for (const name of RESERVED_AUTH_PARAMS)
         if (given.has(name))
-          ctx.addIssue({ code: "custom", path: ["OIDC_AUTH_PARAMS"], message: `must not set ${name} (the server sets it itself)` });
+          ctx.addIssue({ code: "custom", path: ["OIDC_AUTH_PARAMS"], message: `must not set ${name} (it would break the sign-in)` });
     }
 
     const { methods, problems } = resolveMethods(c);

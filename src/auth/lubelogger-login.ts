@@ -154,7 +154,8 @@ export class LubeLoggerKeyLogin implements FormLoginMethod {
   }
 
   async check(fields: FormFields): Promise<FormCheckResult> {
-    const apiKey = fields.apiKey;
+    // a header drops padding around a key anyway, so a pasted "key " is the key
+    const apiKey = fields.apiKey?.trim();
     if (!apiKey || !HEADER_SAFE_KEY.test(apiKey)) return { invalid: WRONG_KEY };
 
     const off = await this.whoami.loginIsOff();
@@ -169,8 +170,10 @@ export class LubeLoggerKeyLogin implements FormLoginMethod {
   }
 
   async recheck(upstream: Record<string, unknown>): Promise<RecheckResult> {
-    const { username, apiKey } = upstream;
-    if (typeof username !== "string" || !username || typeof apiKey !== "string" || !HEADER_SAFE_KEY.test(apiKey))
+    const { username } = upstream;
+    // keys stored before trimming may carry padding
+    const apiKey = typeof upstream.apiKey === "string" ? upstream.apiKey.trim() : undefined;
+    if (typeof username !== "string" || !username || apiKey === undefined || !HEADER_SAFE_KEY.test(apiKey))
       return { ok: false, reason: "refused" };
 
     const off = await this.whoami.loginIsOff();

@@ -205,6 +205,13 @@ await check("OIDC_AUTH_PARAMS may not set protocol parameters", () => {
   const ok = validateConfig({ ...oidc, OIDC_AUTH_PARAMS: "access_type=offline&prompt=consent", AUTH_METHODS: "oidc" });
   assert.ok(ok.ok, JSON.stringify(ok.problems));
 });
+await check("OIDC_AUTH_PARAMS is not checked while oidc is off", () => {
+  const off = validateConfig({ ...ha, ...oidc, OIDC_AUTH_PARAMS: "client_id=x", AUTH_METHODS: "homeassistant" });
+  assert.ok(off.ok, JSON.stringify(off.problems));
+  const on = validateConfig({ ...ha, ...oidc, OIDC_AUTH_PARAMS: "client_id=x", AUTH_METHODS: "homeassistant,oidc" });
+  assert.equal(on.ok, false);
+  assert.ok(on.problems.some((p) => p.includes("must not set client_id (it would break the sign-in)")), String(on.problems));
+});
 await check("list settings are split on commas, trimmed, empties dropped", () => {
   const r = validateConfig({ ...oidc, OIDC_ALLOWED_EMAILS: " a@example.com, ,b@example.com,", AUTH_METHODS: "oidc" });
   assert.deepEqual(r.config.OIDC_ALLOWED_EMAILS, ["a@example.com", "b@example.com"]);

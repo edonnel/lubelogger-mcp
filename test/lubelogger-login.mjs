@@ -170,6 +170,25 @@ await check("key: an unknown key is invalid", async () => {
   assert.equal(mock.requests.length, 0);
 });
 
+await check("key: padding around a key is dropped; a key that cannot go in a header is invalid without a request", async () => {
+  mock.reset();
+  const m = key();
+  const r = await run(() => m.check({ apiKey: " key-alice " }));
+  assert.deepEqual(r, { person: { id: "alice", name: "alice" }, upstream: { username: "alice", apiKey: "key-alice" } });
+  assert.ok(mock.requests.some((q) => q.headers["x-api-key"] === "key-alice"));
+  mock.requests = [];
+  for (const bad of ["keyĀ", "ke\ny", "key-alice\nĀ", "  "]) {
+    assert.deepEqual(await run(() => m.check({ apiKey: bad })), { invalid: "That API key is not valid." }, JSON.stringify(bad));
+  }
+  assert.equal(mock.requests.length, 0);
+  // a key stored with padding still rechecks, and comes back trimmed
+  assert.deepEqual(await key().recheck({ username: "alice", apiKey: "key-alice " }), {
+    ok: true,
+    upstream: { username: "alice", apiKey: "key-alice" },
+    person: { id: "alice", name: "alice" },
+  });
+});
+
 await check("LubeLogger with its login off refuses every password and key, at sign-in and on recheck", async () => {
   mock.reset();
   mock.authOff = true;
@@ -267,7 +286,7 @@ await check("a key connection survives a 404 or 429 on refresh", async () => {
 
 await check("a key a header can't carry is not valid", async () => {
   mock.reset();
-  for (const apiKey of ["key\n", "clé"]) {
+  for (const apiKey of ["keyĀ", "ke\ny", "clé"]) {
     const r = await run(() => key().check({ apiKey }));
     assert.deepEqual(r, { invalid: "That API key is not valid." });
     assert.deepEqual(await key().recheck({ username: "alice", apiKey }), { ok: false, reason: "refused" });

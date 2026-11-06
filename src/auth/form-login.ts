@@ -1,7 +1,7 @@
 // The gate in front of a LubeLogger sign-in form: reads the posted fields, refuses an attempt while its address or
 // username is locked or enough attempts on it are still being checked, runs the login method's check, and records a
-// wrong answer against the limiter. It decides nothing about pages or login state: the provider
-// turns the outcome into a response. Nothing typed is ever logged here.
+// wrong answer against the limiter. It decides nothing about pages or login state: the provider turns the outcome
+// into a response. Nothing typed is ever logged here.
 import type express from "express";
 import type { FormCheckResult, FormFields, FormLoginMethod } from "./login-method.js";
 import { addressKey, FailureLimiter, MAX_FAILURES, MAX_KEY_LENGTH } from "./rate-limit.js";
@@ -49,9 +49,10 @@ export class FormLoginGate {
     // attempts still being checked count too: otherwise a burst of posts all pass before any failure is recorded
     const busy = keys.some((key) => (this.inFlight.get(key) ?? 0) + this.limiter.failureCount(key) >= MAX_FAILURES);
     if (wait > 0 || busy) {
+      const minutes = Math.ceil(wait / 60_000);
       // nothing is sent to LubeLogger, and this refusal is not itself counted as a failure
       // a lock names the minutes until the key is free; attempts still in flight may yet succeed, so no wait is known
-      const locked = wait > 0 ? `Too many attempts. Try again in ${Math.ceil(wait / 60_000)} minutes.` : STILL_CHECKING;
+      const locked = wait > 0 ? `Too many attempts. Try again in ${minutes} ${minutes === 1 ? "minute" : "minutes"}.` : STILL_CHECKING;
       return { fields, username, outcome: { locked } };
     }
 
